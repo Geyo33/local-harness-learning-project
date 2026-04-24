@@ -407,7 +407,7 @@ class ChatSession:
             if (
                 self.messages
                 and self.messages[-1].get("content") == (
-                    "If more tool calls are needed, call them now with no text. If task is complete, give your final answer. Take the above tool call result into account. Always use update_task when any task status change."
+                    "If more tool calls are needed, call them now with no text. If task is complete, give your final answer. Take the above tool call result into account."
                 )
             ):
                 self.messages.pop(-1)
@@ -538,8 +538,6 @@ class ChatSession:
                         "If task is complete, give your final answer. "
                         "Take the above tool call result into account."
                     )
-                    # if self.task_manager:
-                    #     nudge += " Always use update_task when any task status change."
                     self.messages.append({"role": "user", "content": nudge})
             self.tool_call_detected = False
 
