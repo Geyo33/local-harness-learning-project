@@ -40,7 +40,7 @@ class ChatSession:
         self.deny_reason: str = ""
         self.file_manager: FileManager | None = None
         settings = load_settings()
-        file_root = settings.get("file_root")
+        file_root = settings.get("file_root") or "."
         if file_root:
             try:
                 self.file_manager = FileManager(Path(file_root))
@@ -48,7 +48,7 @@ class ChatSession:
             except Exception as e:
                 logging.warning("Could not initialize FileManager: %s", e)
 
-        task_root = Path(file_root) if file_root else Path(".")
+        task_root = Path(file_root)
         try:
             self.task_manager: TaskManager = TaskManager(task_root)
             logging.info("TaskManager initialized at root: %s", task_root)
