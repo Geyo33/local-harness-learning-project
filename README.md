@@ -15,11 +15,14 @@ Built to understand how LLM agent loops, tool orchestration, task planning, and 
 - **Tool approval gate** — every tool call pauses for Allow / Deny / Always-allow before execution
 - **Task planning** — agent can break work into tasks (`plan_tasks`, `update_task`, `add_task`); live sidebar shows the plan
 - **Planner pass** — optional upfront LLM call restricted to planning only, before the main loop starts
-- **File tools** — built-in `list_files`, `read_file`, `edit_file`, `bash` scoped to a configured base directory
-- **Bash tool** — runs commands via WSL (`wsl.exe bash -lc`); Windows paths auto-mapped to `/mnt/...`
+- **File tools** — built-in `list_files`, `read_file`, `edit_file`, `replace_lines`, `bash` scoped to a configured base directory
+- **Bash tool** — runs commands via WSL (`wsl.exe bash -ls`, passed via stdin); Windows paths auto-mapped to `/mnt/...`
 - **Skills system** — extend the LLM with specialised instructions or callable Python functions via `mcp_chatbot/skills/`
 - **Multimodal input** — accepts text files and images alongside chat messages
 - **Mission brief** — static `plan.md` in workspace root injected into every system prompt
+- **Token budget tracker** — per-category token estimates (system / tools / history); triggers rolling summarization at 70% context
+- **Rolling summarization** — compresses old turns into a `[Summary]:` block to keep context within limits
+- **Token usage display** — segmented progress bar in UI showing system / tools / history usage with color thresholds
 - **Gradio UI** — browser-based chat with sidebar for server selection, task list, and settings (optimized for personal use only)
 
 ---
@@ -83,6 +86,7 @@ Servers must be checked in the UI sidebar to activate them.
 mcp_chatbot/
   core/
     config.py          # Configuration
+    context_manager.py # ContextManager — token budget tracker + compression trigger
     llm_client.py      # LLMClient (httpx, streaming + non-streaming)
     server.py          # Server, Tool (MCP lifecycle)
     session.py         # ChatSession (agentic loop)
@@ -92,10 +96,10 @@ mcp_chatbot/
     multimodal.py      # Image/file input handling
     schemas.py         # Pydantic models
   tools/
-    file_manager.py    # FileManager (list/read/edit/bash)
+    file_manager.py    # FileManager (list/read/edit/replace_lines/bash)
     skills_manager.py  # SkillsManager
   skills/              # Skill definitions (SKILL.md + optional scripts.py)
-  memory/              # Placeholder — Future context management planned
+  memory/              # Placeholder — Persistent memory
   settings.py          # settings.json load/save
 ```
 
@@ -128,9 +132,6 @@ Do not run this against sensitive directories or on a shared/public machine.
 
 
 ## Future Plans
-
-### Context Management
-Token budget tracker (per-category usage), rolling summarization triggered at 70% context, token usage display in UI.
 
 ### Persistent Memory
 SQLite episodic store, `remember_fact` / `search_memory` agent tools, optional semantic search via vector DB.
