@@ -12,10 +12,12 @@ from mcp_chatbot.tools.skills_manager import SkillsManager
 from mcp_chatbot.tools.file_manager import FileManager
 from mcp_chatbot.settings import load_settings
 from mcp_chatbot.core.task_manager import TaskManager
+from mcp_chatbot.core.context_manager import ContextManager
 
 
 MAX_PARSE_RETRIES = 3
 DEFAULT_TOOL_TIMEOUT = 30.0
+COMPRESSION_KEEP_TURNS = 4
 
 
 class ChatSession:
@@ -26,7 +28,17 @@ class ChatSession:
         self.llm_client: LLMClient = llm_client
         self._is_initialized: bool = False
         self.messages: list[dict[str, Any]] = []
-        self.token_usage: dict = {"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0, "completion_tokens_details": {"reasoning_tokens": 0}}, "context_size": self.llm_client.max_tokens}
+        self.token_usage: dict = {
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+            "context_size": self.llm_client.max_tokens,
+            "breakdown": {},
+        }
+        self.context_mgr = ContextManager(self.llm_client.max_tokens)
         self._tool_schemas: list[dict[str, Any]] = []
         self._tool_server_map: dict[str, Server] = {}
         self._tool_timeout_map: dict[str, float] = {}
@@ -141,7 +153,7 @@ class ChatSession:
                     "Call update_task(id, in_progress) before starting each task; "
                     "update_task(id, done) when finished. "
                     "If task block get messed up you can rebuild it using plan_tasks(titles)"
-                    "Task tools run silently — no approval needed."
+                    "plan_tasks and add_task require user approval. update_task runs silently."
                 )
 
             file_context = ""
@@ -149,7 +161,8 @@ class ChatSession:
                 file_context = (
                     "\n\n## Files\n"
                     "list_files runs silently, needs to be re-used to check sub-directories. "
-                    "read_file, edit_file, and bash require approval. "
+                    "read_file shows numbered lines — use those line numbers with replace_lines for targeted edits. "
+                    "read_file, edit_file, replace_lines, and bash require approval. "
                     "bash: each command is a separate, stateless WSL shell starting at base_dir — "
                     "chain dependent steps with && in a single command."
                 )
@@ -373,6 +386,7 @@ class ChatSession:
 
         parse_retries = 0  # tracks consecutive malformed-JSON tool call responses
         messages_checkpoint = len(self.messages)
+        _compressed_this_turn = False
 
         while True:
             tools = self._tool_schemas or None
@@ -386,6 +400,15 @@ class ChatSession:
             _hint = ""  # consume — subsequent iterations don't repeat hint
             with open("mcp_chatbot/logs_with_tasks.json", "w") as f:
                 json.dump(call_messages, f, indent=2)
+            breakdown = self.context_mgr.snapshot(call_messages, tools or [])
+            self.token_usage["breakdown"] = breakdown
+            if self.context_mgr.is_near_limit() and not _compressed_this_turn:
+                logging.warning(
+                    "Context at %.0f%% — compressing history", breakdown["pct"] * 100
+                )
+                await self._compress_history()
+                call_messages = self._inject_task_block(self.messages, hint="")
+                _compressed_this_turn = True
             for event in self.llm_client.stream_response(call_messages, tools=tools):
                 if event["type"] == "content":
                     assistant_msg += event["data"]
@@ -476,7 +499,7 @@ class ChatSession:
                 )
                 is_safe_task_tool = (
                     self.task_manager is not None
-                    and tool_name in self.task_manager.tool_names
+                    and tool_name in self.task_manager.safe_tool_names
                 )
 
                 if not (is_safe_file_tool or is_safe_task_tool):
@@ -547,3 +570,45 @@ class ChatSession:
         self.allow_tool_action = action
         self.allow_tool_event.set()
         logging.debug("set_allow_tool_action called with '%s'", action)
+
+    def _summarize(self, messages: list[dict]) -> str | None:
+        """Summarize conversation history using the LLM."""
+        text = "\n".join(
+            f"{m['role'].upper()}: {m.get('content', '')}"
+            for m in messages
+            if m.get("content")
+        )
+        if not text:
+            return None
+        prompt = [{"role": "user", "content": (
+            "Summarize the following conversation concisely. "
+            "Preserve key decisions, facts, tool results, and context "
+            "needed to continue the conversation.\n\n"
+            f"<conversation>\n{text}\n</conversation>"
+        )}]
+        try:
+            response = self.llm_client.get_response(prompt)
+            return response.get("content", "").strip() or None
+        except Exception as e:
+            logging.warning("Summarization failed: %s", e)
+            return None
+
+    async def _compress_history(self) -> None:
+        """Compress old conversation by summarizing and keeping only recent turns."""
+        history = self.messages[1:]
+        user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+        if len(user_indices) <= COMPRESSION_KEEP_TURNS:
+            return
+        cut = user_indices[-COMPRESSION_KEEP_TURNS]
+        to_compress = history[:cut]
+        to_keep = history[cut:]
+        # _summarize uses synchronous httpx
+        summary = self._summarize(to_compress)
+        if summary is None:
+            return
+        self.messages = (
+            [self.messages[0]]
+            + [{"role": "user", "content": f"[Summary]: {summary}"}]
+            + to_keep
+        )
+        logging.info("Compressed %d messages into summary.", len(to_compress))

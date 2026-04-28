@@ -57,7 +57,10 @@ def test_list_files_nonexistent_path_returns_error(base):
 
 def test_read_file_returns_content(base):
     fm = _fm(base)
-    assert fm.read_file("hello.txt") == f"Succesfully read from 'hello.txt'\nContent:\nhello world"
+    result = fm.read_file("hello.txt")
+    assert result.startswith("Successfully read from 'hello.txt'")
+    assert "hello world" in result
+    assert "1 |" in result
 
 
 def test_read_file_blocked_by_gitignore(base):
@@ -173,9 +176,9 @@ def test_edit_file_traversal_blocked(base):
 
 # ── tool_entries & is_safe ────────────────────────────────────────────────────
 
-def test_tool_entries_has_four_items(base):
+def test_tool_entries_has_five_items(base):
     fm = _fm(base)
-    assert len(fm.tool_entries) == 4
+    assert len(fm.tool_entries) == 5
 
 
 def test_list_files_is_safe(base):
@@ -185,6 +188,7 @@ def test_list_files_is_safe(base):
     assert by_name["read_file"] is False
     assert by_name["edit_file"] is False
     assert by_name["bash"] is False
+    assert by_name["replace_lines"] is False
 
 
 def test_is_safe_returns_correct_values(base):
@@ -193,11 +197,12 @@ def test_is_safe_returns_correct_values(base):
     assert fm.is_safe("read_file") is False
     assert fm.is_safe("edit_file") is False
     assert fm.is_safe("bash") is False
+    assert fm.is_safe("replace_lines") is False
 
 
 def test_tool_names_set(base):
     fm = _fm(base)
-    assert fm.tool_names == {"list_files", "read_file", "edit_file", "bash"}
+    assert fm.tool_names == {"list_files", "read_file", "edit_file", "bash", "replace_lines"}
 
 
 # ── execute dispatcher ────────────────────────────────────────────────────────
@@ -211,7 +216,8 @@ def test_execute_list_files(base):
 def test_execute_read_file(base):
     fm = _fm(base)
     result = fm.execute("read_file", {"path": "hello.txt"})
-    assert result == f"Succesfully read from 'hello.txt'\nContent:\nhello world"
+    assert "hello world" in result
+    assert "1 |" in result
 
 
 def test_execute_edit_file(base):
@@ -225,3 +231,128 @@ def test_execute_unknown_tool(base):
     fm = _fm(base)
     result = fm.execute("unknown_tool", {})
     assert "Error" in result or "unknown" in result.lower()
+
+
+# ── replace_lines — happy path ────────────────────────────────────────────────
+
+def test_replace_lines_middle_range(base):
+    (base / "multi.txt").write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 2, 3, "NEW2\nNEW3")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "line1\nNEW2\nNEW3\nline4\n"
+
+
+def test_replace_lines_single_line(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 2, 2, "XXX")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nXXX\nccc\n"
+
+
+def test_replace_lines_first_line(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 1, 1, "NEW_FIRST")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "NEW_FIRST\nbbb\nccc\n"
+
+
+def test_replace_lines_last_line(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 3, 3, "NEW_LAST")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nbbb\nNEW_LAST\n"
+
+
+def test_replace_lines_entire_file(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 1, 3, "ONLY")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY"
+
+
+def test_replace_lines_delete_lines(base):
+    (base / "multi.txt").write_text("keep1\ndelete_me\nkeep2\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 2, 2, "")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "keep1\nkeep2\n"
+
+
+def test_replace_lines_end_clamped_silently(base):
+    (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 1, 9999, "ONLY")
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY"
+
+
+def test_replace_lines_success_message(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 2, 2, "NEW")
+    assert "2" in result and ("Replaced" in result or "replaced" in result)
+
+
+# ── replace_lines — error cases ───────────────────────────────────────────────
+
+def test_replace_lines_start_zero_returns_error(base):
+    (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    assert "Error" in fm.replace_lines("multi.txt", 0, 1, "x")
+
+
+def test_replace_lines_start_negative_returns_error(base):
+    (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    assert "Error" in fm.replace_lines("multi.txt", -1, 1, "x")
+
+
+def test_replace_lines_start_greater_than_end_returns_error(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 3, 1, "x")
+    assert "Error" in result
+
+
+def test_replace_lines_start_beyond_file_returns_error(base):
+    (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", 10, 10, "x")
+    assert "Error" in result and "beyond" in result.lower()
+
+
+def test_replace_lines_missing_file_returns_error(base):
+    fm = _fm(base)
+    assert "Error" in fm.replace_lines("no_such_file.txt", 1, 1, "x")
+
+
+def test_replace_lines_blocked_by_gitignore(base):
+    fm = _fm(base)
+    result = fm.replace_lines("secret.env", 1, 1, "x")
+    assert "Error" in result or "blocked" in result.lower()
+
+
+def test_replace_lines_traversal_blocked(base):
+    fm = _fm(base)
+    result = fm.replace_lines("../../evil.txt", 1, 1, "x")
+    assert "Error" in result or "blocked" in result.lower()
+
+
+# ── replace_lines — execute dispatcher ───────────────────────────────────────
+
+def test_execute_replace_lines(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.execute("replace_lines", {
+        "path": "multi.txt",
+        "start_line": 2,
+        "end_line": 2,
+        "new_str": "REPLACED"
+    })
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nREPLACED\nccc\n"

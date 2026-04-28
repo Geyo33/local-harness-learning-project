@@ -14,7 +14,7 @@ class FileManager:
     - .gitignore patterns deny read and write access.
     """
 
-    _TOOL_NAMES = {"list_files", "read_file", "edit_file", "bash"}
+    _TOOL_NAMES = {"list_files", "read_file", "edit_file", "bash", "replace_lines"}
 
     def __init__(self, base_dir: Path) -> None:
         if not base_dir.exists():
@@ -102,7 +102,12 @@ class FileManager:
         if not resolved.is_file():
             return f"Error: '{path}' is not a file."
         try:
-            return f"Succesfully read from '{path}'\nContent:\n{resolved.read_text(encoding='utf-8')}"
+            content = resolved.read_text(encoding="utf-8")
+            lines = content.splitlines(keepends=True)
+            width = len(str(len(lines)))
+            numbered = "".join(f"{i + 1:>{width}} | {line}" for i, line in enumerate(lines))
+            plural = "" if len(lines) == 1 else "s"
+            return f"Successfully read from '{path}' ({len(lines)} line{plural})\nContent:\n{numbered}"
         except Exception as e:
             return f"Error reading '{path}': {e}"
 
@@ -124,13 +129,56 @@ class FileManager:
         resolved.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
         return f"Edited '{path}'."
 
+    def replace_lines(self, path: str, start_line: int, end_line: int, new_str: str) -> str:
+        resolved, err = self._check(path)
+        if err:
+            return err
+        if not resolved.exists():
+            return f"Error: '{path}' does not exist."
+        if not resolved.is_file():
+            return f"Error: '{path}' is not a file."
+        if start_line < 1:
+            return "Error: start_line must be >= 1."
+        try:
+            content = resolved.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+        lines = content.splitlines(keepends=True)
+        total = len(lines)
+        if start_line > total:
+            return (
+                f"Error: start_line ({start_line}) is beyond the file's "
+                f"line count ({total})."
+            )
+        if end_line < start_line:
+            return f"Error: start_line ({start_line}) must be <= end_line ({end_line})."
+        end_line = min(end_line, total)
+        before = lines[:start_line - 1]
+        after = lines[end_line:]
+        if new_str == "":
+            new_segment = []
+        else:
+            # Add trailing newline when there is surrounding context (before or after),
+            # to avoid fusing with adjacent lines or stripping the file's final newline.
+            if (after or before) and not new_str.endswith("\n"):
+                insertion = new_str + "\n"
+            else:
+                insertion = new_str
+            new_segment = [insertion]
+        try:
+            resolved.write_text("".join(before + new_segment + after), encoding="utf-8")
+        except Exception as e:
+            return f"Error writing '{path}': {e}"
+        return f"Replaced lines {start_line}-{end_line} in '{path}'."
+
     def bash(self, commands: list[str]) -> str:
         if not commands:
             return "Error: no commands provided."
         results = []
         for cmd in commands:
             r = subprocess.run(
-                ["wsl.exe", "bash", "-lc", cmd],
+                ["wsl.exe", "bash", "-ls"],
+                input=cmd,
                 capture_output=True, text=True, timeout=30, cwd=self._base,
                 encoding="utf-8",
             )
@@ -148,6 +196,13 @@ class FileManager:
                 return self.edit_file(
                     arguments.get("path", ""),
                     arguments.get("old_str", ""),
+                    arguments.get("new_str", ""),
+                )
+            if tool_name == "replace_lines":
+                return self.replace_lines(
+                    arguments.get("path", ""),
+                    arguments.get("start_line", 0),
+                    arguments.get("end_line", 0),
                     arguments.get("new_str", ""),
                 )
             if tool_name == "bash":
@@ -223,6 +278,7 @@ class FileManager:
                             "If old_str is empty, creates a new file with new_str as content (fails if file exists). "
                             "If file exists and you don't know its content use the read_file tool to help you populate old_str."
                             "If old_str is provided, replaces the first occurrence of old_str with new_str."
+                            "ALWAYS prioritize replace_lines tool for editing a file !!!"
                         ),
                         "parameters": {
                             "type": "object",
@@ -290,6 +346,47 @@ Do NOT use echo or echo -e to create code files—they produce literal \n charac
                                 }
                             },
                             "required": ["commands"],
+                        },
+                    },
+                },
+                "safe": False,
+            },
+            {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "replace_lines",
+                        "description": (
+                            "Replace a range of lines in an existing file by line number. "
+                            "Use read_file first to see line numbers, then specify start_line through "
+                            "end_line (1-indexed, inclusive). "
+                            "Set new_str to empty string to delete those lines. "
+                            "new_str is used verbatim — include a trailing newline if you want one. "
+                            "end_line beyond the last line is clamped silently. "
+                            "Always replace lines from bottom to top when using replace_lines mutliple time on the same file as lines count will change with each edit. "
+                            "Prefer this over edit_file for targeted changes to large files."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Relative path to the file to edit.",
+                                },
+                                "start_line": {
+                                    "type": "integer",
+                                    "description": "1-indexed first line of the range to replace (inclusive).",
+                                },
+                                "end_line": {
+                                    "type": "integer",
+                                    "description": "1-indexed last line of the range to replace (inclusive).",
+                                },
+                                "new_str": {
+                                    "type": "string",
+                                    "description": "Replacement content. Empty string deletes the lines.",
+                                },
+                            },
+                            "required": ["path", "start_line", "end_line", "new_str"],
                         },
                     },
                 },

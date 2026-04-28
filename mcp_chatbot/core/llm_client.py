@@ -50,7 +50,7 @@ class LLMClient:
             payload["tool_choice"] = "auto"
         return url, headers, payload
 
-    # Unused for now, streaming response only
+    # Used for context compression
     def get_response(
         self,
         messages: list[dict[str, Any]],
@@ -61,7 +61,7 @@ class LLMClient:
         """
         url, headers, payload = self._build_payload(messages, tools, stream=False)
         try:
-            with httpx.Client() as client:
+            with httpx.Client(timeout=self.timeout) as client:
                 response = client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
                 return response.json()["choices"][0]["message"]

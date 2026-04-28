@@ -149,30 +149,44 @@ async def update_task_panel():
     return gr.update(value=_render_task_html())
 
 def update_usage():
-    used_tokens = chat_session.session.token_usage["usage"]["total_tokens"]
-    total_tokens = chat_session.session.token_usage["context_size"]
-    percentage = round((used_tokens / total_tokens) * 100)
-    
-    # Format tokens with 'k' suffix if >= 1000
-    def format_tokens(tokens):
-        if tokens >= 1000:
-            return f"{tokens / 1000:.1f}k"
-        return str(tokens)
-    
-    used_display = format_tokens(used_tokens)
-    total_display = format_tokens(total_tokens)
-    
+    breakdown = chat_session.session.token_usage.get("breakdown", {})
+    max_tokens = chat_session.session.token_usage["context_size"]
+
+    def fmt(n):
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+    if not breakdown or not max_tokens:
+        html = '<div style="padding:6px 4px;color:#4a5568;font-size:12px;text-align:center;">Context: —</div>'
+        return gr.update(value=html)
+
+    system = breakdown.get("system", 0)
+    tools = breakdown.get("tools", 0)
+    history = breakdown.get("history", 0)
+    total = breakdown.get("total", 0)
+    pct = breakdown.get("pct", 0.0)
+
+    sys_pct = system / max_tokens * 100
+    tools_pct = tools / max_tokens * 100
+    hist_pct = history / max_tokens * 100
+
+    bar_color = "#e53e3e" if pct >= 0.85 else ("#d69e2e" if pct >= 0.70 else "#13b0a8")
+
     html = f"""
-    <div style="display: flex; justify-content: center; width: 100%;">
-        <div style="width: 50%; display: flex; align-items: center; gap: 12px;">
-            <span style="color: #e2e8f0; font-size: 14px; white-space: nowrap; font-weight: 500;">Token usage:</span>
-            <div style="flex: 1; background-color: #1a1f2e; border-radius: 4px; overflow: hidden; border: 1px solid #2d3748;">
-                <div style="width: {percentage}%; height: 24px; background: linear-gradient(90deg, #13b0a8, #20c997); 
-                            display: flex; align-items: center; justify-content: center; color: #0f1419; font-weight: bold; font-size: 12px; transition: width 0.3s ease;">
-                    {percentage}%
-                </div>
+    <div style="padding: 6px 4px;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+            <span style="color: #e2e8f0; font-size: 12px; white-space: nowrap; font-weight: 500;">Context</span>
+            <div style="flex: 1; background-color: #1a1f2e; border-radius: 3px; overflow: hidden; border: 1px solid #2d3748; height: 16px; display: flex;">
+                <div style="width: {sys_pct:.1f}%; background: #4a6fa5; height: 100%;" title="System: {fmt(system)}"></div>
+                <div style="width: {tools_pct:.1f}%; background: #805ad5; height: 100%;" title="Tools: {fmt(tools)}"></div>
+                <div style="width: {hist_pct:.1f}%; background: {bar_color}; height: 100%;" title="History: {fmt(history)}"></div>
             </div>
-            <span style="color: #a0aec0; font-size: 12px; white-space: nowrap;">{used_display} / {total_display}</span>
+            <span style="color: #a0aec0; font-size: 11px; white-space: nowrap;">{round(pct * 100)}% · {fmt(total)}/{fmt(max_tokens)}</span>
+        </div>
+        <div style="display: flex; gap: 10px; font-size: 10px; color: #718096; padding-left: 2px;">
+            <span><span style="color:#4a6fa5;">■</span> sys {fmt(system)}</span>
+            <span><span style="color:#805ad5;">■</span> tools {fmt(tools)}</span>
+            <span><span style="color:{bar_color};">■</span> hist {fmt(history)}</span>
+            <span style="color:#4a5568;">free {fmt(max_tokens - total)}</span>
         </div>
     </div>
     """

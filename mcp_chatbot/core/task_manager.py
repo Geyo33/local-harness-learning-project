@@ -84,7 +84,7 @@ class TaskManager:
     def add_task(self, title: str, after: str | None = None) -> str:
         data = self._read()
         tasks = data["tasks"]
-        new_id = str(max((int(t["id"]) for t in tasks), default=0) + 1)
+        new_id = str(int(after)+1) if after else str(max((int(t["id"]) for t in tasks), default=0) + 1)
         new_task = {"id": new_id, "title": title, "status": "pending"}
         if after is not None:
             idx = next((i for i, t in enumerate(tasks) if t["id"] == after), None)
@@ -92,6 +92,10 @@ class TaskManager:
                 current_ids = [t["id"] for t in tasks]
                 return f"No task with id={after}. Current ids: {current_ids}"
             tasks.insert(idx + 1, new_task)
+            for i in range(idx + 2, len(tasks)):
+                # Increment the ID of the task at after insert index 'i'
+                current_id = int(tasks[i]["id"])
+                tasks[i]["id"] = str(current_id + 1)
         else:
             tasks.append(new_task)
         self._write(data)
@@ -100,6 +104,10 @@ class TaskManager:
     @property
     def tool_names(self) -> set[str]:
         return {"plan_tasks", "update_task", "add_task"}
+
+    @property
+    def safe_tool_names(self) -> set[str]:
+        return {"update_task"}
 
     def execute(self, tool_name: str, arguments: dict) -> str:
         try:
