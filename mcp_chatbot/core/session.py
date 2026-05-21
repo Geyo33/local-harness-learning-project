@@ -5,6 +5,8 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+import time
+import datetime
 
 from mcp_chatbot.core.server import Server
 from mcp_chatbot.core.llm_client import LLMClient
@@ -69,6 +71,7 @@ class ChatSession:
             self.task_manager = None
 
         self.planner_mode: str = settings.get("planner_mode", "auto")
+        self.agent_loop = {"active": False, "state": ""}
 
     async def list_servers(self) -> None:
         try:
@@ -116,6 +119,13 @@ class ChatSession:
                         self._tool_timeout_map[tool.name] = (
                             server.timeout if server.timeout is not None else DEFAULT_TOOL_TIMEOUT
                         )
+
+            def timestamp_to_datetime(unix_time):
+                return datetime.datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %H:%M:%S")
+            timestamp = time.time()
+            timestring = timestamp_to_datetime(timestamp)
+
+            identity = "You are a helpful assistant. "
 
             skill_index = self._skills_manager.get_index()
             if skill_index:
@@ -168,8 +178,9 @@ class ChatSession:
                 )
 
             system_content = (
-                "You are a helpful assistant. "
-                "Use tools when they help; reply directly when they don't."
+                f"{identity}"
+                f"Current date and time : {timestring}\n\n"
+                "\nUse tools when they help; reply directly when they don't."
                 + task_context
                 + file_context
                 + skills_prompt
@@ -203,14 +214,14 @@ class ChatSession:
         if hint:
             prefix_parts.append(hint)
         if block:
-            prefix_parts.append(block)
+            prefix_parts.append("(System info - Here's the list of tasks you built, never talk about it to the user, use tools to keep it up-to-date:\n "+block+")")
         if not prefix_parts:
             return messages
         prefix = "\n\n".join(prefix_parts)
         last = messages[-1]
         content = last["content"]
         if isinstance(content, str):
-            new_content = prefix + "\n\n" + content
+            new_content = prefix + "\n\n" + content + "# IMPORTANT INSTRUCTION : NEVER ADD ANY ADDITIONAL TEXT OR COMMENTS WHEN CALLING TOOL(S) !!! You either call tool(s) or you speak, NEVER both at the same time."
         else:
             new_content = [{"type": "text", "text": prefix}] + list(content)
         return messages[:-1] + [{**last, "content": new_content}]
@@ -255,7 +266,7 @@ class ChatSession:
             {
                 "role": "user",
                 "content": (
-                    "You are a task planner. Your only job is to call plan_tasks with a list of "
+                    "You are a task planner. Your only job is to call the plan_tasks tool with a list of "
                     "short, actionable task titles for the following request. Do nothing else.\n\n"
                     f"Request: {text}"
                 ),
@@ -389,6 +400,7 @@ class ChatSession:
         _compressed_this_turn = False
 
         while True:
+            self.agent_loop = {"active": True, "state": ""}
             tools = self._tool_schemas or None
             with open("mcp_chatbot/log.json", "w") as f:
                 json.dump(self.messages, f, indent=2)
@@ -406,9 +418,12 @@ class ChatSession:
                 logging.warning(
                     "Context at %.0f%% — compressing history", breakdown["pct"] * 100
                 )
+                self.agent_loop["state"] = "compressing"
                 await self._compress_history()
+                self.agent_loop["state"] = ""
                 call_messages = self._inject_task_block(self.messages, hint="")
                 _compressed_this_turn = True
+            self.agent_loop["state"] = "streaming"
             for event in self.llm_client.stream_response(call_messages, tools=tools):
                 if event["type"] == "content":
                     assistant_msg += event["data"]
@@ -425,12 +440,13 @@ class ChatSession:
                     assistant_msg += event["data"]
             logging.debug("tool_names: %s", tool_names)
             logging.debug("tool_args: %s", tool_args)
+            self.agent_loop["state"] = ""
 
             # pop the "Use the above tool call result..." nudge from the previous iteration
             if (
                 self.messages
                 and self.messages[-1].get("content") == (
-                    "If more tool calls are needed, call them now with no text. If task is complete, give your final answer. Take the above tool call result into account."
+                    "(System instruction - If more tool calls are needed, call them now with no text. If all tasks are complete, give your final answer. Take the above tool call result into account.)"
                 )
             ):
                 self.messages.pop(-1)
@@ -481,6 +497,7 @@ class ChatSession:
                             pass
                     self._injected_skill_schemas = []
                     self._active_skill = None
+                self.agent_loop = {"active": False, "state": ""}
                 with open("mcp_chatbot/log.json", "w") as f:
                     json.dump(self.messages, f, indent=2)
                 break
@@ -535,7 +552,7 @@ class ChatSession:
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.get("id", tool_name),
-                    "content": f"**Result:**\n\n{result_text}",
+                    "content": f"**Result of your '{tool_name}' tool call:**\n\n{result_text}",
                 })
                 if tool_name == "read_skill":
                     skill_name = json.loads(
@@ -555,11 +572,14 @@ class ChatSession:
                             "Injected %d skill function schema(s) for '%s'.",
                             len(fn_schemas), skill_name,
                         )
+                        nudge_func = "\nDo not make any comment and call the appropriate tool immediately !"
+                        nudge = f"(System instruction - Use the tool call result above to complete the user's request.{nudge_func if fn_schemas else ''})"
+                        self.messages.append({"role": "user", "content": nudge})
                 else:
                     nudge = (
-                        "If more tool calls are needed, call them now with no text. "
-                        "If task is complete, give your final answer. "
-                        "Take the above tool call result into account."
+                        "(System instruction - If more tool calls are needed, call them now with no text. "
+                        "If all tasks are complete, give your final answer. "
+                        "Take the above tool call result into account.)"
                     )
                     self.messages.append({"role": "user", "content": nudge})
             self.tool_call_detected = False

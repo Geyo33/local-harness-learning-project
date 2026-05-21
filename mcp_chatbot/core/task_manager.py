@@ -32,6 +32,8 @@ class TaskManager:
 
     def _write(self, data: dict) -> None:
         tmp = self._state_file.with_suffix(".json.tmp")
+        if self.is_completed(data):
+            data = {"tasks": []}
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, self._state_file)
 
@@ -43,6 +45,10 @@ class TaskManager:
         except json.JSONDecodeError:
             logging.warning("tasks.json is corrupt — using empty plan.")
             return {"tasks": []}
+
+    def is_completed(self, data) -> bool:
+        completed_check = [True if task["status"] == "done" else False for task in data["tasks"]]
+        return all(completed_check)
 
     def is_empty(self) -> bool:
         return not self._read()["tasks"]

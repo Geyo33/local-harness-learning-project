@@ -21,7 +21,7 @@ async def setup_and_initialize():
     """Handles all configuration and startup logic."""
     logging.info("--- Starting MCP Client Setup ---")
     try:
-        config = Configuration()
+        config = Configuration('gradio', 1)
         config_path = "mcp_chatbot/servers_config.json"
 
         if not Path(config_path).exists():
@@ -32,7 +32,7 @@ async def setup_and_initialize():
         logging.info(f"server config: {server_config}")
         
         servers = [Server(name, srv_config) for name, srv_config in server_config["mcpServers"].items()] if server_config else []
-        llm_client = LLMClient(config.llm_api_key, config.model)
+        llm_client = LLMClient(config.llm_api_key, config.model, config.temp, config.frontend)
         
         chat_session_initial = ChatSession(servers, llm_client)
 

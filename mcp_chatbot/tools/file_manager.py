@@ -91,7 +91,7 @@ class FileManager:
             rel = str(item.relative_to(self._base)).replace("\\", "/")
             if not self._is_ignored(rel):
                 entries.append(rel + ("/" if item.is_dir() else ""))
-        return "\n".join(entries) if entries else "(empty)"
+        return "\n\nFiles found:\n\n"+"\n".join(entries) if entries else "(empty)"
 
     def read_file(self, path: str) -> str:
         resolved, err = self._check(path)

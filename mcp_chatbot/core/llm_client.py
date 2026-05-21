@@ -10,10 +10,12 @@ import httpx
 class LLMClient:
     """Manages communication with the LLM provider."""
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, temp: float, frontend: str) -> None:
         self.api_key: str = api_key
         self.model: str = model
+        self.temp: float = temp
         self.max_tokens = 20480
+        self.frontend: str = frontend
         self.timeout = httpx.Timeout(
             timeout=300.0,
             read=60.0,
@@ -40,6 +42,7 @@ class LLMClient:
         payload: dict[str, Any] = {
             "messages": messages,
             "model": self.model,
+            "temperature": self.temp,
             "max_tokens": self.max_tokens,
             "stream": stream,
             "stream_options": {"include_usage": True},
