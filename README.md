@@ -4,7 +4,7 @@
 
 A local agentic harness built around the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Connects to one or more MCP servers, exposes their tools to an LLM, and lets you chat with the agent in a browser — with per-tool-call approval controls.
 
-Built to understand how LLM agent loops, tool orchestration, task planning, and context management actually work at the code level.
+Built to understand how LLM agent loops, tool orchestration, task planning, context management, and memory actually work at the code level.
 
 ---
 
@@ -15,15 +15,20 @@ Built to understand how LLM agent loops, tool orchestration, task planning, and 
 - **Tool approval gate** — every tool call pauses for Allow / Deny / Always-allow before execution
 - **Task planning** — agent can break work into tasks (`plan_tasks`, `update_task`, `add_task`); live sidebar shows the plan
 - **Planner pass** — optional upfront LLM call restricted to planning only, before the main loop starts
-- **File tools** — built-in `list_files`, `read_file`, `edit_file`, `replace_lines`, `bash` scoped to a configured base directory
-- **Bash tool** — runs commands via WSL (`wsl.exe bash -ls`, passed via stdin); Windows paths auto-mapped to `/mnt/...`
+- **File tools** — built-in `list_files`, `read_file`, `replace_lines`, `bash` scoped to a configured base directory
+- **Bash tool** — runs commands via WSL (`wsl.exe bash -s`, passed via stdin); Windows paths auto-mapped to `/mnt/...`
 - **Skills system** — extend the LLM with specialised instructions or callable Python functions via `mcp_chatbot/skills/`
 - **Multimodal input** — accepts text files and images alongside chat messages
 - **Mission brief** — static `plan.md` in workspace root injected into every system prompt
 - **Token budget tracker** — per-category token estimates (system / tools / history); triggers rolling summarization at 70% context
 - **Rolling summarization** — compresses old turns into a `[Summary]:` block to keep context within limits
 - **Token usage display** — segmented progress bar in UI showing system / tools / history usage with color thresholds
-- **Gradio UI** — browser-based chat with sidebar for server selection, task list, and settings (optimized for personal use only)
+- **Episodic memory** — SQLite-backed episode store; last N sessions injected as `[Memory]:` block at startup
+- **Key facts store** — agent-writable persistent facts (`remember_fact`, `update_fact`, `forget_fact`); top-N injected at startup ranked by time-decay score; IDs shown for direct update without search round-trip
+- **Memory search** — `search_memory` tool: FTS5 BM25 on episodes + key facts, LIKE fallback on syntax error
+- **Semantic memory server** — standalone MCP subproject (`memory_server/`) exposing a `search_memory` tool with three-pass retrieval: cosine similarity on stored embeddings (`BAAI/bge-small-en-v1.5` via LM Studio), FTS5 BM25 keyword search, and spaCy (`en_core_web_sm`) entity/noun-chunk score boost; lazy backfill embeds missing episodes on first call; gracefully degrades to keyword-only if embedding endpoint is unreachable, and skips entity boost if spaCy is absent
+- **Playbook / procedural memory** — persistent workflow store; auto-triggered after all tasks complete; top-N procedures injected into system prompt by confidence score; dedup via SequenceMatcher (Incomplete, simple system prompt injection for now, will tie up with task planning in the future.)
+- **Gradio UI** — browser-based chat with sidebar for server selection, task list, memory, and playbook tabs (optimized for personal use only)
 
 ---
 
@@ -33,7 +38,7 @@ Built to understand how LLM agent loops, tool orchestration, task planning, and 
 - [Gradio](https://gradio.app/) for the web UI
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) for server connections
 - `httpx` for LLM API calls (OpenAI-compatible endpoint)
-- LM Studio (local) or Groq (cloud) as the LLM backend (tested with Gemma 4 E4B Q6_K)
+- LM Studio (local) or Groq (cloud) as the LLM backend
 
 ---
 
@@ -78,6 +83,38 @@ Edit `mcp_chatbot/servers_config.json`:
 
 Servers must be checked in the UI sidebar to activate them.
 
+### Semantic Memory Server
+
+`memory_server/` is a standalone `uv` subproject (isolates `numpy` and `spacy` from the main app). Register it in `servers_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "uv",
+      "args": [
+        "--directory", "memory_server",
+        "run", "server.py",
+        "--embed-url", "http://localhost:1234",
+        "--embed-model", "text-embedding-bge-small-en-v1.5"
+      ]
+    }
+  }
+}
+```
+
+| Arg | Default | Notes |
+|---|---|---|
+| `--embed-url` | `http://localhost:1234` | LM Studio base URL (any OpenAI-compatible embedding endpoint works) |
+| `--embed-model` | `text-embedding-bge-small-en-v1.5` | Model served by LM Studio (`BAAI/bge-small-en-v1.5`) |
+| `--db-path` | auto | Defaults to `<file_root>/.agent/memory.db` read from `settings.json` |
+
+**spaCy:** `pip install spacy && python -m spacy download en_core_web_sm`. Optional — entity boost skipped if absent, retrieval still works.
+
+**Graceful degradation:** embedding endpoint unreachable → semantic pass skipped, keyword (FTS5/LIKE) still runs. spaCy absent → entity boost skipped.
+
+**Suppression:** when this server is active, the main app's local `search_memory` tool is excluded from the LLM schema — the MCP version wins.
+
 ---
 
 ## Project Layout
@@ -96,11 +133,15 @@ mcp_chatbot/
     multimodal.py      # Image/file input handling
     schemas.py         # Pydantic models
   tools/
-    file_manager.py    # FileManager (list/read/edit/replace_lines/bash)
+    file_manager.py    # FileManager (list/read/replace_lines/bash)
     skills_manager.py  # SkillsManager
+  memory/
+    store.py           # EpisodicStore (SQLite — episodes + key_facts + FTS5)
+    memory_manager.py  # MemoryManager (remember_fact, update_fact, forget_fact, search_memory)
+    playbook.py        # PlaybookManager (procedural memory, record_procedure)
   skills/              # Skill definitions (SKILL.md + optional scripts.py)
-  memory/              # Placeholder — Persistent memory
   settings.py          # settings.json load/save
+memory_server/         # Standalone MCP server — semantic search (numpy, spaCy, embeddings)
 ```
 
 ---
@@ -120,9 +161,9 @@ The LLM sees skill names and descriptions in its system prompt, calls `read_skil
 
 **This project has known security issues that are intentional to the learning scope.**
 
-- **Bash tool runs unsandboxed WSL commands.** Any prompt injection or malicious tool result could execute arbitrary shell commands. 
+- **Bash tool runs unsandboxed WSL commands.** Any prompt injection or malicious tool result could execute arbitrary shell commands.
 - **File tool has no authentication.** Anyone with access to the Gradio URL can read/edit files within `file_root`.
-- **Tool approval gate is the only guardrail.** "Always-allow"(Auto-tool) mode bypasses it entirely.
+- **Tool approval gate is the only guardrail.** "Always-allow" (Auto-tool) mode bypasses it entirely.
 - **No input sanitisation** on MCP tool results before they enter the LLM context.
 - **Gradio runs without auth** — do not expose to public networks.
 
@@ -130,22 +171,14 @@ Do not run this against sensitive directories or on a shared/public machine.
 
 ---
 
+## Roadmap
 
-## Future Plans
-
-### Persistent Memory
-SQLite episodic store, `remember_fact` / `search_memory` agent tools, optional semantic search via vector DB.
-
-### Agent Loop Hardening
-Auto-compaction in loop, surface-agnostic event model (typed events instead of `o|o` strings), state persistence across restarts, optional thinking phase.
-
-### CLI & API Surface
-`python -m mcp_chatbot.cli` entry point, minimal FastAPI endpoint (`POST /chat`, streaming).
-
-### Multi-Agent Patterns
-Hierarchical orchestrator/worker, parallel fan-out via `asyncio.gather`, A2A compatibility.
+- **Next** — Tasks + Playbook redesign: hierarchical task→steps structure, loop safety guards, on-demand playbook retrieval.
+- **Agent loop hardening** — Auto-compaction check at turn start (not just pre-LLM-call) , typed event model, state persistence, reasoning effort control, feedback layer, progressive tool disclosure.
+- **CLI & API surface** — `python -m mcp_chatbot.cli`, FastAPI endpoint, MCP/Agent cards.
+- **Multi-agent patterns** — Orchestrator/worker, parallel fan-out, A2A compatibility.
 
 ---
 
-#### Gradio ui:
+#### Gradio UI:
 ![ui](img/ui.png)
