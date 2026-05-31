@@ -14,7 +14,7 @@ class FileManager:
     - .gitignore patterns deny read and write access.
     """
 
-    _TOOL_NAMES = {"list_files", "read_file", "edit_file", "bash", "replace_lines"}
+    _TOOL_NAMES = {"list_files", "read_file", "bash", "replace_lines"}
 
     def __init__(self, base_dir: Path) -> None:
         if not base_dir.exists():
@@ -33,6 +33,7 @@ class FileManager:
             line = line.strip()
             if line and not line.startswith("#"):
                 patterns.append(line)
+        patterns.append(".git")
         return patterns
 
     def _is_ignored(self, rel: str) -> bool:
@@ -73,6 +74,17 @@ class FileManager:
             return None, f"Error: path '{path}' is blocked by .gitignore."
         return resolved, None
 
+    def _walk(self, directory: Path) -> list[Path]:
+        entries = []
+        for item in sorted(directory.iterdir()):
+            rel = str(item.relative_to(self._base)).replace("\\", "/")
+            if self._is_ignored(rel):
+                continue
+            entries.append(item)
+            if item.is_dir():
+                entries.extend(self._walk(item))
+        return entries
+
     # ── tool operations ────────────────────────────────────────────────────
 
     def list_files(self, path: str = "") -> str:
@@ -87,10 +99,9 @@ class FileManager:
             if self._is_ignored(rel):
                 return f"Error: path '{path}' is blocked by .gitignore."
         entries = []
-        for item in sorted(target.iterdir()):
+        for item in self._walk(target):
             rel = str(item.relative_to(self._base)).replace("\\", "/")
-            if not self._is_ignored(rel):
-                entries.append(rel + ("/" if item.is_dir() else ""))
+            entries.append(rel + ("/" if item.is_dir() else ""))
         return "\n\nFiles found:\n\n"+"\n".join(entries) if entries else "(empty)"
 
     def read_file(self, path: str) -> str:
@@ -103,33 +114,20 @@ class FileManager:
             return f"Error: '{path}' is not a file."
         try:
             content = resolved.read_text(encoding="utf-8")
-            lines = content.splitlines(keepends=True)
+            lines = content.splitlines(keepends=False)
             width = len(str(len(lines)))
-            numbered = "".join(f"{i + 1:>{width}} | {line}" for i, line in enumerate(lines))
+            numbered = "".join(f"{i + 1:>{width}} | '{line}'\n" for i, line in enumerate(lines))
             plural = "" if len(lines) == 1 else "s"
             return f"Successfully read from '{path}' ({len(lines)} line{plural})\nContent:\n{numbered}"
         except Exception as e:
             return f"Error reading '{path}': {e}"
 
-    def edit_file(self, path: str, old_str: str, new_str: str) -> str:
-        resolved, err = self._check(path)
-        if err:
-            return err
-        if old_str == "":
-            if resolved.exists():
-                return f"Error: '{path}' already exists. Use old_str/new_str to edit it."
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(new_str, encoding="utf-8")
-            return f"Created '{path}'."
-        if not resolved.exists():
-            return f"Error: '{path}' does not exist."
-        content = resolved.read_text(encoding="utf-8")
-        if old_str not in content:
-            return f"Error: text not found in '{path}'."
-        resolved.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
-        return f"Edited '{path}'."
-
-    def replace_lines(self, path: str, start_line: int, end_line: int, new_str: str) -> str:
+    def replace_lines(self, path: str, edits: list[dict]) -> str:
+        if not path or not path.strip():
+            return (
+                "Error: no 'path' provided. replace_lines requires the relative file "
+                "path as the first argument. Retry with path set."
+            )
         resolved, err = self._check(path)
         if err:
             return err
@@ -137,53 +135,124 @@ class FileManager:
             return f"Error: '{path}' does not exist."
         if not resolved.is_file():
             return f"Error: '{path}' is not a file."
-        if start_line < 1:
-            return "Error: start_line must be >= 1."
+        if not edits:
+            return "Error: edits list is empty."
         try:
-            content = resolved.read_text(encoding="utf-8")
+            # newline="" disables newline translation so EOLs round-trip unchanged
+            with open(resolved, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
         except Exception as e:
             return f"Error reading '{path}': {e}"
         lines = content.splitlines(keepends=True)
         total = len(lines)
-        if start_line > total:
-            return (
-                f"Error: start_line ({start_line}) is beyond the file's "
-                f"line count ({total})."
-            )
-        if end_line < start_line:
-            return f"Error: start_line ({start_line}) must be <= end_line ({end_line})."
-        end_line = min(end_line, total)
-        before = lines[:start_line - 1]
-        after = lines[end_line:]
-        if new_str == "":
-            new_segment = []
-        else:
-            # Add trailing newline when there is surrounding context (before or after),
-            # to avoid fusing with adjacent lines or stripping the file's final newline.
-            if (after or before) and not new_str.endswith("\n"):
-                insertion = new_str + "\n"
+
+        # Validate all edits before touching the file (all-or-nothing)
+        for i, edit in enumerate(edits):
+            start = edit.get("start_line", 0)
+            end = edit.get("end_line", 0)
+            if start < 1:
+                return f"Error: edit {i} start_line must be >= 1."
+            if end < start:
+                return f"Error: edit {i} end_line ({end}) must be >= start_line ({start})."
+            if start > total:
+                return (
+                    f"Error: edit {i} start_line ({start}) is beyond the file's "
+                    f"line count ({total})."
+                )
+            expected = edit.get("expected")
+            if expected is None:
+                return (
+                    f"Error: edit {i} missing required 'expected' "
+                    "(the exact current lines being replaced)."
+                )
+            if not isinstance(expected, list):
+                return (
+                    f"Error: edit {i} 'expected' must be an array of strings "
+                    "(one element per line), not a single string."
+                )
+            end_clamped = min(end, total)
+            actual = [lines[j].rstrip("\r\n") for j in range(start - 1, end_clamped)]
+            if actual != expected:
+                return (
+                    f"Error: edit {i} 'expected' does not match file lines "
+                    f"{start}-{end_clamped}.\n"
+                    "File has:\n"
+                    + "\n".join(f"{start + k} | {a!r}" for k, a in enumerate(actual))
+                    + "\nYou sent:\n"
+                    + "\n".join(f"{e!r}" for e in expected)
+                    + "\nRe-read the file and retry with the exact lines "
+                    "(including indentation)."
+                )
+
+        # Sort descending by start_line; clamp end_line to file length
+        sorted_edits = sorted(
+            enumerate(edits),
+            key=lambda x: x[1]["start_line"],
+            reverse=True,
+        )
+        clamped = [
+            (orig_i, e["start_line"], min(e["end_line"], total), e.get("new_lines", []))
+            for orig_i, e in sorted_edits
+        ]
+
+        # Overlap check: sorted descending, so clamped[i+1] sits above clamped[i]
+        for i in range(len(clamped) - 1):
+            curr_orig_i, curr_start, curr_end, _ = clamped[i]
+            next_orig_i, next_start, next_end, _ = clamped[i + 1]
+            if next_end >= curr_start:
+                return (
+                    f"Error: edits {next_orig_i} and {curr_orig_i} overlap "
+                    f"(lines {next_start}-{next_end} and {curr_start}-{curr_end})."
+                )
+
+        # Detect the file's EOL so new lines match its convention (avoid mixed EOLs)
+        eol = "\r\n" if "\r\n" in content else "\r" if "\r" in content else "\n"
+        had_trailing_nl = content.endswith(("\n", "\r"))
+
+        # Apply bottom-up (sorted descending = bottom of file first)
+        for _, start, end, new_lines in clamped:
+            before = lines[: start - 1]
+            after = lines[end:]
+            if not new_lines:
+                new_segment: list[str] = []
             else:
-                insertion = new_str
-            new_segment = [insertion]
+                joined = eol.join(new_lines)
+                if after:
+                    new_segment = [joined + eol]
+                else:
+                    # segment now ends the file: match the file's original EOF state
+                    new_segment = [joined + (eol if had_trailing_nl else "")]
+            lines = before + new_segment + after
+
         try:
-            resolved.write_text("".join(before + new_segment + after), encoding="utf-8")
+            with open(resolved, "w", encoding="utf-8", newline="") as f:
+                f.write("".join(lines))
         except Exception as e:
             return f"Error writing '{path}': {e}"
-        return f"Replaced lines {start_line}-{end_line} in '{path}'."
+
+        n = len(edits)
+        final_content = "".join(lines)
+        return f"Applied {n} edit(s) to '{path}'. New line count: {len(final_content.splitlines())}."
 
     def bash(self, commands: list[str]) -> str:
         if not commands:
             return "Error: no commands provided."
         results = []
         for cmd in commands:
-            r = subprocess.run(
-                ["wsl.exe", "bash", "-ls"],
-                input=cmd,
-                capture_output=True, text=True, timeout=30, cwd=self._base,
-                encoding="utf-8",
-            )
-            output = (r.stdout + r.stderr).strip()
-            results.append(f"$ {cmd}\n{output if output else '(no output) - Success'}")
+            try:
+                r = subprocess.run(
+                    ["wsl.exe", "bash", "-s"],
+                    input=cmd.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"),
+                    capture_output=True,
+                    timeout=30,
+                    cwd=self._base,
+                )
+                output = (r.stdout + r.stderr).decode("utf-8", errors="replace").strip()
+                if not output:
+                    output = "Success" if r.returncode == 0 else f"Exit code {r.returncode}"
+            except subprocess.TimeoutExpired:
+                output = "Error: timed out after 30 seconds."
+            results.append(f"$ {cmd}\n{output}")
         return "\n\n".join(results)
 
     def execute(self, tool_name: str, arguments: dict) -> str:
@@ -192,18 +261,10 @@ class FileManager:
                 return self.list_files(arguments.get("path", ""))
             if tool_name == "read_file":
                 return self.read_file(arguments.get("path", ""))
-            if tool_name == "edit_file":
-                return self.edit_file(
-                    arguments.get("path", ""),
-                    arguments.get("old_str", ""),
-                    arguments.get("new_str", ""),
-                )
             if tool_name == "replace_lines":
                 return self.replace_lines(
                     arguments.get("path", ""),
-                    arguments.get("start_line", 0),
-                    arguments.get("end_line", 0),
-                    arguments.get("new_str", ""),
+                    arguments.get("edits", []),
                 )
             if tool_name == "bash":
                 return self.bash(arguments.get("commands", []))
@@ -231,7 +292,7 @@ class FileManager:
                     "function": {
                         "name": "list_files",
                         "description": (
-                            f"List files and directories under the configured base directory ({self._base}). "
+                            f"List files, directories, subdirectories and their files under the configured base directory ({self._base}). "
                             "Pass an empty string or a relative subdirectory path."
                         ),
                         "parameters": {
@@ -272,40 +333,6 @@ class FileManager:
                 "schema": {
                     "type": "function",
                     "function": {
-                        "name": "edit_file",
-                        "description": (
-                            "Create or edit a file. "
-                            "If old_str is empty, creates a new file with new_str as content (fails if file exists). "
-                            "If file exists and you don't know its content use the read_file tool to help you populate old_str."
-                            "If old_str is provided, replaces the first occurrence of old_str with new_str."
-                            "ALWAYS prioritize replace_lines tool for editing a file !!!"
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Relative path to the file to create or edit.",
-                                },
-                                "old_str": {
-                                    "type": "string",
-                                    "description": "Text to find and replace. Empty string to create a new file.",
-                                },
-                                "new_str": {
-                                    "type": "string",
-                                    "description": "Replacement text, or full content when creating.",
-                                },
-                            },
-                            "required": ["path", "old_str", "new_str"],
-                        },
-                    },
-                },
-                "safe": False,
-            },
-            {
-                "schema": {
-                    "type": "function",
-                    "function": {
                         "name": "bash",
                         "description": (
                             f"""Run one or more bash commands sequentially via WSL, starting in the base directory ({self._base}). 
@@ -317,16 +344,14 @@ To perform sequential operations like changing directories (cd) followed by anot
 chain them into a single string using '&&' or ';'. 
 Variables and state do not persist across separate commands—use command substitution $() or pipe (|) within a single command to share data.
 
-⚠️ Quoting Warning: Always wrap file and directory paths in double quotes when they contain spaces 
-(e.g. `cat "./a2a agent/src/main.py"` not `cat ./a2a agent/src/main.py`). 
+⚠️ Quoting Warning: Always wrap file and directory paths in double quotes when they contain spaces
+(e.g. `cat "./a2a agent/src/main.py"` not `cat ./a2a agent/src/main.py`).
 Failure to quote will cause the shell to split the path into separate arguments.
 
-⚠️ File Creation Warning: For multi-line code or files with special characters, use heredoc syntax with cat:
-  cat > "file.py" << 'EOF'
-  def hello():
-      print("world")
-  EOF
-Do NOT use echo or echo -e to create code files—they produce literal \n characters instead of actual newlines.
+⚠️ Heredoc Warning: When writing file content that contains backticks or $ (e.g. Markdown code blocks, Python/shell source), always use a single-quoted heredoc delimiter to prevent bash from expanding command substitutions and variables:
+  CORRECT:   cat > file.md <<'EOF'
+  INCORRECT: cat > file.md <<EOF
+With an unquoted EOF, backtick expressions inside the body are executed as commands, corrupting the output.
 
 ✓ Best Practices:
 - Chain operations with && to ensure earlier commands succeed before running later ones.
@@ -357,14 +382,18 @@ Do NOT use echo or echo -e to create code files—they produce literal \n charac
                     "function": {
                         "name": "replace_lines",
                         "description": (
-                            "Replace a range of lines in an existing file by line number. "
-                            "Use read_file first to see line numbers, then specify start_line through "
-                            "end_line (1-indexed, inclusive). "
-                            "Set new_str to empty string to delete those lines. "
-                            "new_str is used verbatim — include a trailing newline if you want one. "
-                            "end_line beyond the last line is clamped silently. "
-                            "Always replace lines from bottom to top when using replace_lines mutliple time on the same file as lines count will change with each edit. "
-                            "Prefer this over edit_file for targeted changes to large files."
+                            "Replace one or more line ranges in an existing file. "
+                            "ALWAYS call read_file first to get current line numbers and content. "
+                            "Specify start_line through end_line (1-indexed, inclusive). "
+                            "For each edit you MUST echo the exact current lines in 'expected' — "
+                            "copy them verbatim from read_file (including all leading indentation); "
+                            "the tool rejects the edit if 'expected' does not match the file. "
+                            "Preserve indentation in new_lines too. "
+                            "Pass all targeted edits for a file in a single call. "
+                            "Set new_lines to an empty array to delete lines. "
+                            "Each element is one line — no newline characters needed. "
+                            "Use \"\" as an element for a blank line. "
+                            "end_line beyond the last line is clamped silently."
                         ),
                         "parameters": {
                             "type": "object",
@@ -373,20 +402,37 @@ Do NOT use echo or echo -e to create code files—they produce literal \n charac
                                     "type": "string",
                                     "description": "Relative path to the file to edit.",
                                 },
-                                "start_line": {
-                                    "type": "integer",
-                                    "description": "1-indexed first line of the range to replace (inclusive).",
-                                },
-                                "end_line": {
-                                    "type": "integer",
-                                    "description": "1-indexed last line of the range to replace (inclusive).",
-                                },
-                                "new_str": {
-                                    "type": "string",
-                                    "description": "Replacement content. Empty string deletes the lines.",
+                                "edits": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "start_line": {
+                                                "type": "integer",
+                                                "description": "1-indexed first line of the range to replace (inclusive).",
+                                            },
+                                            "end_line": {
+                                                "type": "integer",
+                                                "description": "1-indexed last line of the range to replace (inclusive).",
+                                            },
+                                            "expected": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "description": "The EXACT current lines being replaced (1 element per line, no newline chars, include all leading whitespace). Tool verifies this against the file and rejects the edit on mismatch. Copy verbatim from read_file output.",
+                                            },
+                                            "new_lines": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "description": "Replacement lines. Each element is one line — no newline characters needed. Preserve exact indentation (⚠️ include all leading spaces or tabs ⚠️). Use \"\" for a blank line. Empty array deletes the range.",
+                                            },
+                                        },
+                                        "required": ["start_line", "end_line", "expected", "new_lines"],
+                                    },
+                                    "description": "List of line-range edits to apply. All edits applied atomically.",
                                 },
                             },
-                            "required": ["path", "start_line", "end_line", "new_str"],
+                            "required": ["path", "edits"],
                         },
                     },
                 },

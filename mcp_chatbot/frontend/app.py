@@ -1,3 +1,4 @@
+import asyncio
 import gradio as gr
 from mcp_chatbot.core.session import ChatSession
 from mcp_chatbot.core.server import Server
@@ -39,6 +40,7 @@ async def setup_and_initialize():
 
         await chat_session_initial.list_servers()
         await chat_session_initial.initialize_servers()
+        chat_session_initial.load_episodes = False
         await chat_session_initial.build_system_message()
 
         chat_session.session = chat_session_initial
@@ -82,6 +84,7 @@ async def shutdown_client():
     """Called when Gradio is closing to ensure clean exit."""
     if chat_session.session:
         logging.info("\n--- Initiating Graceful Shutdown ---")
+        await chat_session.session.save_episode()
         await chat_session.session.cleanup_servers()
         chat_session.session = None
 
@@ -92,6 +95,107 @@ async def save_planner_mode(value: str):
     if chat_session.session:
         chat_session.session.planner_mode = value
     return f"Planner mode set to: {value}"
+
+
+def render_episodes(episodes: list[dict]) -> str:
+    if not episodes:
+        return "No episodes stored yet."
+    import datetime
+    parts = []
+    for ep in episodes:
+        date_str = datetime.datetime.fromtimestamp(ep["created_at"]).strftime("%Y-%m-%d %H:%M")
+        parts.append(f"**{date_str} — {ep['source'].title()}**\n\n{ep['summary']}")
+    return "\n\n---\n\n".join(parts)
+
+
+def render_key_facts(facts: list[dict]) -> str:
+    if not facts:
+        return "No key facts stored yet."
+    import datetime
+    lines = []
+    for f in facts:
+        date_str = datetime.datetime.fromtimestamp(f["created_at"]).strftime("%Y-%m-%d")
+        lines.append(f"**#{f['id']}** {f['fact']}  _{f['source']}, {date_str}_")
+    return "\n\n".join(lines)
+
+
+def load_memory_tab() -> tuple[str, str]:
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return "Memory not available.", "Memory not available."
+    episodes = chat_session.session.episodic_store.get_recent(50)
+    facts = chat_session.session.episodic_store.get_key_facts()
+    return render_episodes(episodes), render_key_facts(facts)
+
+
+async def clear_memory() -> tuple[str, str]:
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return "Memory not available.", "Memory not available."
+    chat_session.session.episodic_store.clear_all()
+    await chat_session.session.build_system_message()
+    return render_episodes([]), render_key_facts([])
+
+
+def render_playbook(entries: list[dict]) -> str:
+    if not entries:
+        return "*No procedures recorded yet.*"
+    import datetime
+    parts = []
+    for e in entries:
+        date_str = datetime.datetime.fromtimestamp(e["created_at"]).strftime("%Y-%m-%d")
+        parts.append(
+            f"**#{e['id']}** [{e['source']}]  \n"
+            f"*{e['pattern']}*  \n"
+            f"→ {e['action']}  \n"
+            f"_{date_str}, confidence {e['confidence']}_"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+def load_playbook_tab() -> str:
+    if not chat_session.session or not chat_session.session.playbook_manager:
+        return "Playbook not available."
+    entries = chat_session.session.playbook_manager.get_top_n(50)
+    return render_playbook(entries)
+
+
+def clear_playbook() -> str:
+    if not chat_session.session or not chat_session.session.playbook_manager:
+        return "Playbook not available."
+    chat_session.session.playbook_manager.clear_all()
+    return render_playbook([])
+
+
+async def show_memory_choice():
+    """Called after setup completes. Shows choice UI if episodes exist, else enables input directly."""
+    session = chat_session.session
+    if not session:
+        return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
+    if not session.episodic_store:
+        session.load_episodes = True
+        await session.build_system_message()
+        return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
+    episodes = await asyncio.to_thread(session.episodic_store.get_recent, 1)
+    if not episodes:
+        session.load_episodes = True
+        await session.build_system_message()
+        return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
+    return gr.update(visible=True), gr.update(visible=True), gr.update(interactive=False)
+
+
+async def _apply_memory_choice(load: bool):
+    if not chat_session.session:
+        return gr.update(), gr.update(), gr.update()
+    chat_session.session.load_episodes = load
+    await chat_session.session.build_system_message()
+    return gr.update(visible=False), gr.update(visible=False), gr.update(interactive=True)
+
+
+async def choose_yes():
+    return await _apply_memory_choice(True)
+
+
+async def choose_no():
+    return await _apply_memory_choice(False)
 
 
 async def save_file_root(path: str):
@@ -323,6 +427,14 @@ def build_app():
                             tool_allow_btn = gr.Button("Allow", variant="primary", size="lg", scale=1, visible=False)
                             tool_deny_btn = gr.Button("Deny", variant="stop", size="lg", scale=1, visible=False)
                         
+                        memory_choice_md = gr.Markdown(
+                            "# Load previous session memory?",
+                            visible=False,
+                        )
+                        with gr.Row(visible=False, variant="panel") as memory_choice_row:
+                            yes_memory_btn = gr.Button("Load memory", variant="primary",   size="lg")
+                            no_memory_btn  = gr.Button("Start fresh",  variant="secondary", size="lg")
+
                         with gr.Row(max_height=80):
                             msg_input = gr.MultimodalTextbox(
                                 sources=["upload","microphone"],
@@ -332,6 +444,7 @@ def build_app():
                                 show_label=False,
                                 placeholder="...",
                                 container=True,
+                                interactive=False,
                             )
                         
                     
@@ -375,7 +488,22 @@ def build_app():
                 )
                 planner_mode_status = gr.Markdown("")
 
-        demo.load(setup_and_initialize).success(servers_state, outputs=mcp_list).success(update_usage, outputs=usage_bar).success(update_task_panel, outputs=task_list_display)
+            with gr.Tab("Memory"):
+                gr.Markdown("# EPISODIC MEMORY\n\n")
+                memory_list = gr.Markdown("No episodes stored yet.", label="Episodes")
+                gr.Markdown("\n\n# KEY FACTS\n\n")
+                facts_list = gr.Markdown("No key facts stored yet.", label="Key Facts")
+                with gr.Row():
+                    memory_refresh_btn = gr.Button("Refresh", variant="secondary", size="sm")
+                    memory_clear_btn = gr.Button("Clear Memory", variant="stop", size="sm")
+
+            with gr.Tab("Playbook"):
+                playbook_list = gr.Markdown("*No procedures recorded yet.*", label="Procedures")
+                with gr.Row():
+                    playbook_refresh_btn = gr.Button("Refresh", variant="secondary", size="sm")
+                    playbook_clear_btn = gr.Button("Clear Playbook", variant="stop", size="sm")
+
+        demo.load(setup_and_initialize).success(servers_state, outputs=mcp_list).success(update_usage, outputs=usage_bar).success(update_task_panel, outputs=task_list_display).success(load_memory_tab, outputs=[memory_list, facts_list]).success(load_playbook_tab, outputs=playbook_list).success(show_memory_choice, outputs=[memory_choice_md, memory_choice_row, msg_input])
 
         demo.unload(shutdown_client)
 
@@ -405,6 +533,9 @@ def build_app():
                 logging.info("Always Allow OFF")
         auto_tool.select(autotool, inputs=auto_tool)
 
+        yes_memory_btn.click(choose_yes, outputs=[memory_choice_md, memory_choice_row, msg_input])
+        no_memory_btn.click(choose_no,   outputs=[memory_choice_md, memory_choice_row, msg_input])
+
         def close_app():
             logging.info("\n--- Shutdown Complete ---")
             gr.close_all()
@@ -421,7 +552,13 @@ def build_app():
         )
 
         planner_mode_radio.change(save_planner_mode, inputs=planner_mode_radio, outputs=planner_mode_status)
-        
+
+        memory_refresh_btn.click(load_memory_tab, outputs=[memory_list, facts_list])
+        memory_clear_btn.click(clear_memory, outputs=[memory_list, facts_list])
+
+        playbook_refresh_btn.click(load_playbook_tab, outputs=playbook_list)
+        playbook_clear_btn.click(clear_playbook, outputs=playbook_list)
+
     return demo
     
 

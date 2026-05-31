@@ -28,6 +28,7 @@ class TaskManager:
                     self._state_file,
                 )
         self._write({"tasks": []})
+        self._last_all_done: bool = False
         logging.info("TaskManager initialized at %s", self._state_file)
 
     def _write(self, data: dict) -> None:
@@ -82,6 +83,7 @@ class TaskManager:
         for task in data["tasks"]:
             if task["id"] == id:
                 task["status"] = status
+                self._last_all_done = self.is_completed(data)
                 self._write(data)
                 return f"Success: Task {id} updated to '{status}'."
         current_ids = [t["id"] for t in data["tasks"]]

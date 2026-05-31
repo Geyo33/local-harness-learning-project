@@ -1,5 +1,7 @@
 from pathlib import Path
 import pytest
+import subprocess
+from unittest.mock import patch, MagicMock
 
 
 @pytest.fixture()
@@ -125,60 +127,11 @@ def test_list_files_build_dir_itself_blocked(base):
     assert "Error" in result or "blocked" in result.lower()
 
 
-# ── edit_file — create ────────────────────────────────────────────────────────
-
-def test_edit_file_creates_new_file(base):
-    fm = _fm(base)
-    result = fm.edit_file("new.txt", "", "content here")
-    assert "Error" not in result
-    assert (base / "new.txt").read_text() == "content here"
-
-
-def test_edit_file_create_errors_if_exists(base):
-    fm = _fm(base)
-    result = fm.edit_file("hello.txt", "", "overwrite")
-    assert "Error" in result or "exists" in result.lower()
-
-
-def test_edit_file_create_makes_parent_dirs(base):
-    fm = _fm(base)
-    result = fm.edit_file("deep/dir/file.txt", "", "hi")
-    assert "Error" not in result
-    assert (base / "deep" / "dir" / "file.txt").read_text() == "hi"
-
-
-# ── edit_file — replace ───────────────────────────────────────────────────────
-
-def test_edit_file_replaces_first_occurrence(base):
-    fm = _fm(base)
-    result = fm.edit_file("hello.txt", "hello", "goodbye")
-    assert "Error" not in result
-    assert (base / "hello.txt").read_text() == "goodbye world"
-
-
-def test_edit_file_old_str_not_found_returns_error(base):
-    fm = _fm(base)
-    result = fm.edit_file("hello.txt", "NOTHERE", "x")
-    assert "Error" in result or "not found" in result.lower()
-
-
-def test_edit_file_blocked_by_gitignore(base):
-    fm = _fm(base)
-    result = fm.edit_file("secret.env", "", "bad")
-    assert "Error" in result or "blocked" in result.lower()
-
-
-def test_edit_file_traversal_blocked(base):
-    fm = _fm(base)
-    result = fm.edit_file("../../evil.txt", "", "evil")
-    assert "Error" in result or "blocked" in result.lower()
-
-
 # ── tool_entries & is_safe ────────────────────────────────────────────────────
 
-def test_tool_entries_has_five_items(base):
+def test_tool_entries_has_four_items(base):
     fm = _fm(base)
-    assert len(fm.tool_entries) == 5
+    assert len(fm.tool_entries) == 4
 
 
 def test_list_files_is_safe(base):
@@ -186,7 +139,6 @@ def test_list_files_is_safe(base):
     by_name = {e["schema"]["function"]["name"]: e["safe"] for e in fm.tool_entries}
     assert by_name["list_files"] is True
     assert by_name["read_file"] is False
-    assert by_name["edit_file"] is False
     assert by_name["bash"] is False
     assert by_name["replace_lines"] is False
 
@@ -195,14 +147,8 @@ def test_is_safe_returns_correct_values(base):
     fm = _fm(base)
     assert fm.is_safe("list_files") is True
     assert fm.is_safe("read_file") is False
-    assert fm.is_safe("edit_file") is False
     assert fm.is_safe("bash") is False
     assert fm.is_safe("replace_lines") is False
-
-
-def test_tool_names_set(base):
-    fm = _fm(base)
-    assert fm.tool_names == {"list_files", "read_file", "edit_file", "bash", "replace_lines"}
 
 
 # ── execute dispatcher ────────────────────────────────────────────────────────
@@ -220,13 +166,6 @@ def test_execute_read_file(base):
     assert "1 |" in result
 
 
-def test_execute_edit_file(base):
-    fm = _fm(base)
-    result = fm.execute("edit_file", {"path": "new.txt", "old_str": "", "new_str": "hi"})
-    assert "Error" not in result
-    assert (base / "new.txt").exists()
-
-
 def test_execute_unknown_tool(base):
     fm = _fm(base)
     result = fm.execute("unknown_tool", {})
@@ -238,7 +177,7 @@ def test_execute_unknown_tool(base):
 def test_replace_lines_middle_range(base):
     (base / "multi.txt").write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 2, 3, "NEW2\nNEW3")
+    result = fm.replace_lines("multi.txt", [{"start_line": 2, "end_line": 3, "expected": ["line2", "line3"], "new_lines": ["NEW2", "NEW3"]}])
     assert "Error" not in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "line1\nNEW2\nNEW3\nline4\n"
 
@@ -246,7 +185,7 @@ def test_replace_lines_middle_range(base):
 def test_replace_lines_single_line(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 2, 2, "XXX")
+    result = fm.replace_lines("multi.txt", [{"start_line": 2, "end_line": 2, "expected": ["bbb"], "new_lines": ["XXX"]}])
     assert "Error" not in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nXXX\nccc\n"
 
@@ -254,7 +193,7 @@ def test_replace_lines_single_line(base):
 def test_replace_lines_first_line(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 1, 1, "NEW_FIRST")
+    result = fm.replace_lines("multi.txt", [{"start_line": 1, "end_line": 1, "expected": ["aaa"], "new_lines": ["NEW_FIRST"]}])
     assert "Error" not in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "NEW_FIRST\nbbb\nccc\n"
 
@@ -262,7 +201,7 @@ def test_replace_lines_first_line(base):
 def test_replace_lines_last_line(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 3, 3, "NEW_LAST")
+    result = fm.replace_lines("multi.txt", [{"start_line": 3, "end_line": 3, "expected": ["ccc"], "new_lines": ["NEW_LAST"]}])
     assert "Error" not in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nbbb\nNEW_LAST\n"
 
@@ -270,15 +209,15 @@ def test_replace_lines_last_line(base):
 def test_replace_lines_entire_file(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 1, 3, "ONLY")
+    result = fm.replace_lines("multi.txt", [{"start_line": 1, "end_line": 3, "expected": ["aaa", "bbb", "ccc"], "new_lines": ["ONLY"]}])
     assert "Error" not in result
-    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY"
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY\n"
 
 
 def test_replace_lines_delete_lines(base):
     (base / "multi.txt").write_text("keep1\ndelete_me\nkeep2\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 2, 2, "")
+    result = fm.replace_lines("multi.txt", [{"start_line": 2, "end_line": 2, "expected": ["delete_me"], "new_lines": []}])
     assert "Error" not in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "keep1\nkeep2\n"
 
@@ -286,16 +225,16 @@ def test_replace_lines_delete_lines(base):
 def test_replace_lines_end_clamped_silently(base):
     (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 1, 9999, "ONLY")
+    result = fm.replace_lines("multi.txt", [{"start_line": 1, "end_line": 9999, "expected": ["aaa", "bbb"], "new_lines": ["ONLY"]}])
     assert "Error" not in result
-    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY"
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "ONLY\n"
 
 
 def test_replace_lines_success_message(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 2, 2, "NEW")
-    assert "2" in result and ("Replaced" in result or "replaced" in result)
+    result = fm.replace_lines("multi.txt", [{"start_line": 2, "end_line": 2, "expected": ["bbb"], "new_lines": ["NEW"]}])
+    assert "Applied" in result and "1 edit" in result
 
 
 # ── replace_lines — error cases ───────────────────────────────────────────────
@@ -303,43 +242,43 @@ def test_replace_lines_success_message(base):
 def test_replace_lines_start_zero_returns_error(base):
     (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
     fm = _fm(base)
-    assert "Error" in fm.replace_lines("multi.txt", 0, 1, "x")
+    assert "Error" in fm.replace_lines("multi.txt", [{"start_line": 0, "end_line": 1, "new_lines": ["x"]}])
 
 
 def test_replace_lines_start_negative_returns_error(base):
     (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
     fm = _fm(base)
-    assert "Error" in fm.replace_lines("multi.txt", -1, 1, "x")
+    assert "Error" in fm.replace_lines("multi.txt", [{"start_line": -1, "end_line": 1, "new_lines": ["x"]}])
 
 
 def test_replace_lines_start_greater_than_end_returns_error(base):
     (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 3, 1, "x")
+    result = fm.replace_lines("multi.txt", [{"start_line": 3, "end_line": 1, "new_lines": ["x"]}])
     assert "Error" in result
 
 
 def test_replace_lines_start_beyond_file_returns_error(base):
     (base / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
     fm = _fm(base)
-    result = fm.replace_lines("multi.txt", 10, 10, "x")
+    result = fm.replace_lines("multi.txt", [{"start_line": 10, "end_line": 10, "new_lines": ["x"]}])
     assert "Error" in result and "beyond" in result.lower()
 
 
 def test_replace_lines_missing_file_returns_error(base):
     fm = _fm(base)
-    assert "Error" in fm.replace_lines("no_such_file.txt", 1, 1, "x")
+    assert "Error" in fm.replace_lines("no_such_file.txt", [{"start_line": 1, "end_line": 1, "new_lines": ["x"]}])
 
 
 def test_replace_lines_blocked_by_gitignore(base):
     fm = _fm(base)
-    result = fm.replace_lines("secret.env", 1, 1, "x")
+    result = fm.replace_lines("secret.env", [{"start_line": 1, "end_line": 1, "new_lines": ["x"]}])
     assert "Error" in result or "blocked" in result.lower()
 
 
 def test_replace_lines_traversal_blocked(base):
     fm = _fm(base)
-    result = fm.replace_lines("../../evil.txt", 1, 1, "x")
+    result = fm.replace_lines("../../evil.txt", [{"start_line": 1, "end_line": 1, "new_lines": ["x"]}])
     assert "Error" in result or "blocked" in result.lower()
 
 
@@ -350,9 +289,345 @@ def test_execute_replace_lines(base):
     fm = _fm(base)
     result = fm.execute("replace_lines", {
         "path": "multi.txt",
-        "start_line": 2,
-        "end_line": 2,
-        "new_str": "REPLACED"
+        "edits": [{"start_line": 2, "end_line": 2, "expected": ["bbb"], "new_lines": ["REPLACED"]}],
     })
     assert "Error" not in result
+    assert "Applied" in result
     assert (base / "multi.txt").read_text(encoding="utf-8") == "aaa\nREPLACED\nccc\n"
+
+
+# ── replace_lines — batch ─────────────────────────────────────────────────────
+
+def test_replace_lines_batch_two_edits_non_overlapping(base):
+    """Two edits on separate regions both applied correctly."""
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\nddd\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [
+        {"start_line": 1, "end_line": 1, "expected": ["aaa"], "new_lines": ["AAA"]},
+        {"start_line": 3, "end_line": 3, "expected": ["ccc"], "new_lines": ["CCC"]},
+    ])
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "AAA\nbbb\nCCC\nddd\n"
+
+
+def test_replace_lines_batch_order_independent(base):
+    """Passing edits top-to-bottom produces the same result as bottom-to-top."""
+    (base / "a.txt").write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+    (base / "b.txt").write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+    fm = _fm(base)
+    fm.replace_lines("a.txt", [
+        {"start_line": 2, "end_line": 2, "expected": ["2"], "new_lines": ["X"]},
+        {"start_line": 4, "end_line": 4, "expected": ["4"], "new_lines": ["Y"]},
+    ])
+    fm.replace_lines("b.txt", [
+        {"start_line": 4, "end_line": 4, "expected": ["4"], "new_lines": ["Y"]},
+        {"start_line": 2, "end_line": 2, "expected": ["2"], "new_lines": ["X"]},
+    ])
+    expected = "1\nX\n3\nY\n5\n"
+    assert (base / "a.txt").read_text(encoding="utf-8") == expected
+    assert (base / "b.txt").read_text(encoding="utf-8") == expected
+
+
+def test_replace_lines_batch_overlap_returns_error_and_no_write(base):
+    """Overlapping edits return an error and leave the file unchanged."""
+    original = "aaa\nbbb\nccc\nddd\n"
+    (base / "multi.txt").write_text(original, encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [
+        {"start_line": 2, "end_line": 4, "expected": ["bbb", "ccc", "ddd"], "new_lines": ["X"]},
+        {"start_line": 3, "end_line": 5, "expected": ["ccc", "ddd"], "new_lines": ["Y"]},
+    ])
+    assert "Error" in result and "overlap" in result.lower()
+    assert (base / "multi.txt").read_text(encoding="utf-8") == original
+
+
+def test_replace_lines_batch_adjacent_not_overlapping(base):
+    """Adjacent ranges [1,2] and [3,4] don't trigger overlap error."""
+    (base / "multi.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [
+        {"start_line": 1, "end_line": 2, "expected": ["a", "b"], "new_lines": ["A"]},
+        {"start_line": 3, "end_line": 4, "expected": ["c", "d"], "new_lines": ["B"]},
+    ])
+    assert "Error" not in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == "A\nB\n"
+
+
+def test_replace_lines_batch_empty_list_returns_error(base):
+    (base / "multi.txt").write_text("aaa\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [])
+    assert "Error" in result
+
+
+def test_replace_lines_batch_invalid_one_edit_no_write(base):
+    """If any edit is invalid, no write occurs (all-or-nothing)."""
+    original = "aaa\nbbb\nccc\n"
+    (base / "multi.txt").write_text(original, encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [
+        {"start_line": 1, "end_line": 1, "expected": ["aaa"], "new_lines": ["OK"]},
+        {"start_line": 0, "end_line": 1, "new_lines": ["BAD"]},
+    ])
+    assert "Error" in result
+    assert (base / "multi.txt").read_text(encoding="utf-8") == original
+
+
+def test_replace_lines_batch_success_message_n_edits(base):
+    (base / "multi.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [
+        {"start_line": 1, "end_line": 1, "expected": ["aaa"], "new_lines": ["AAA"]},
+        {"start_line": 3, "end_line": 3, "expected": ["ccc"], "new_lines": ["CCC"]},
+    ])
+    assert "Applied 2 edit(s)" in result
+    assert "New line count:" in result
+
+
+def test_replace_lines_success_no_file_content_in_result(base):
+    """Success response must not contain file content — no reinject."""
+    (base / "multi.txt").write_text("unique_sentinel_value\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("multi.txt", [{"start_line": 2, "end_line": 2, "expected": ["bbb"], "new_lines": ["NEW"]}])
+    assert "unique_sentinel_value" not in result
+
+
+# ── replace_lines — new_lines interface ──────────────────────────────────────
+
+def test_replace_lines_multiline_replacement(base):
+    """Replace one line with three lines using new_lines array."""
+    (base / "f.txt").write_text("header\nold\nfooter\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("f.txt", [{"start_line": 2, "end_line": 2, "expected": ["old"], "new_lines": ["new_a", "new_b", "new_c"]}])
+    assert "Error" not in result
+    assert (base / "f.txt").read_text(encoding="utf-8") == "header\nnew_a\nnew_b\nnew_c\nfooter\n"
+
+
+def test_replace_lines_blank_line_via_empty_element(base):
+    """An empty string element in new_lines produces a blank line."""
+    (base / "f.txt").write_text("aaa\nbbb\nccc\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("f.txt", [{"start_line": 2, "end_line": 2, "expected": ["bbb"], "new_lines": ["content", ""]}])
+    assert "Error" not in result
+    assert (base / "f.txt").read_text(encoding="utf-8") == "aaa\ncontent\n\nccc\n"
+
+
+def test_replace_lines_line_count_accurate_for_multiline(base):
+    """Reported line count must reflect actual lines, not list-element count."""
+    (base / "f.txt").write_text("x\ny\nz\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("f.txt", [{"start_line": 2, "end_line": 2, "expected": ["y"], "new_lines": ["a", "b", "c"]}])
+    # Replaced 1 line with 3 → 5 lines total (x, a, b, c, z)
+    assert "New line count: 5" in result
+
+
+# ── replace_lines — path & expected guards (post-hardening) ───────────────────
+
+def test_replace_lines_missing_path_returns_actionable_error(base):
+    fm = _fm(base)
+    result = fm.replace_lines("", [{"start_line": 1, "end_line": 1, "expected": ["x"], "new_lines": ["y"]}])
+    assert "Error" in result and "path" in result.lower()
+
+
+def test_replace_lines_missing_expected_returns_error(base):
+    (base / "m.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("m.txt", [{"start_line": 1, "end_line": 1, "new_lines": ["X"]}])
+    assert "Error" in result and "expected" in result.lower()
+
+
+def test_replace_lines_expected_mismatch_no_write(base):
+    """Wrong indentation in expected -> rejected, file untouched."""
+    original = "def f():\n    return 1\n"
+    (base / "m.py").write_text(original, encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("m.py", [{"start_line": 2, "end_line": 2, "expected": ["return 1"], "new_lines": ["    return 2"]}])
+    assert "Error" in result and "does not match" in result
+    assert (base / "m.py").read_text(encoding="utf-8") == original
+
+
+def test_replace_lines_expected_match_applies(base):
+    (base / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("m.py", [{"start_line": 2, "end_line": 2, "expected": ["    return 1"], "new_lines": ["    return 2"]}])
+    assert "Error" not in result
+    assert (base / "m.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"
+
+
+def test_replace_lines_expected_not_list_returns_error(base):
+    (base / "m.txt").write_text("x\n", encoding="utf-8")
+    fm = _fm(base)
+    result = fm.replace_lines("m.txt", [{"start_line": 1, "end_line": 1, "expected": "x", "new_lines": ["Y"]}])
+    assert "Error" in result and "array" in result.lower()
+
+
+def test_replace_lines_preserves_no_trailing_newline(base):
+    p = base / "m.txt"
+    p.write_bytes(b"one\ntwo\nthree")  # no trailing newline
+    fm = _fm(base)
+    fm.replace_lines("m.txt", [{"start_line": 3, "end_line": 3, "expected": ["three"], "new_lines": ["THREE"]}])
+    assert p.read_bytes() == b"one\ntwo\nTHREE"
+
+
+def test_replace_lines_preserves_trailing_newline(base):
+    p = base / "m.txt"
+    p.write_bytes(b"one\ntwo\nthree\n")
+    fm = _fm(base)
+    fm.replace_lines("m.txt", [{"start_line": 3, "end_line": 3, "expected": ["three"], "new_lines": ["THREE"]}])
+    assert p.read_bytes() == b"one\ntwo\nTHREE\n"
+
+
+def test_replace_lines_preserves_crlf_eol(base):
+    """New lines adopt the file's CRLF convention; untouched lines unchanged."""
+    p = base / "m.txt"
+    p.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    fm = _fm(base)
+    fm.replace_lines("m.txt", [{"start_line": 1, "end_line": 1, "expected": ["one"], "new_lines": ["ONE", "EXTRA"]}])
+    assert p.read_bytes() == b"ONE\r\nEXTRA\r\ntwo\r\nthree\r\n"
+
+
+# ── bash — unit tests (no WSL required) ──────────────────────────────────────
+
+def _completed(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
+    m = MagicMock()
+    m.returncode = returncode
+    m.stdout = stdout
+    m.stderr = stderr
+    return m
+
+
+def test_bash_empty_commands_no_subprocess(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run") as mock_run:
+        result = fm.bash([])
+        mock_run.assert_not_called()
+    assert "Error" in result
+
+
+def test_bash_uses_stdin_flag(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["echo hello"])
+    assert mock_run.call_args.args[0] == ["wsl.exe", "bash", "-s"]
+
+
+def test_bash_input_is_bytes(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["echo hello"])
+    assert isinstance(mock_run.call_args.kwargs["input"], bytes)
+
+
+def test_bash_crlf_normalized_to_lf(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["line1\r\nline2\r\n"])
+    assert mock_run.call_args.kwargs["input"] == b"line1\nline2\n"
+
+
+def test_bash_lf_only_unchanged(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["line1\nline2\n"])
+    assert mock_run.call_args.kwargs["input"] == b"line1\nline2\n"
+
+
+def test_bash_lone_cr_normalized_to_lf(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["line1\rline2\r"])
+    assert mock_run.call_args.kwargs["input"] == b"line1\nline2\n"
+
+
+def test_bash_output_decoded_from_bytes(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed(stdout=b"hello world")):
+        result = fm.bash(["echo hello"])
+    assert "hello world" in result
+
+
+def test_bash_stdout_and_stderr_combined(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run",
+               return_value=_completed(stdout=b"out", stderr=b"err")):
+        result = fm.bash(["cmd"])
+    assert "out" in result and "err" in result
+
+
+def test_bash_multiple_commands_run_separately(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed()) as mock_run:
+        fm.bash(["cmd1", "cmd2"])
+    assert mock_run.call_count == 2
+
+
+def test_bash_nonzero_exit_no_output_reports_exit_code(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed(returncode=1)):
+        result = fm.bash(["exit 1"])
+    assert "Success" not in result
+    assert "Exit code 1" in result
+
+
+def test_bash_zero_exit_no_output_still_reports_success(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run", return_value=_completed(returncode=0)):
+        result = fm.bash(["true"])
+    assert "Success" in result
+
+
+def test_bash_timeout_returns_error_string(base):
+    fm = _fm(base)
+    with patch("mcp_chatbot.tools.file_manager.subprocess.run",
+               side_effect=subprocess.TimeoutExpired(cmd=["wsl.exe", "bash", "-s"], timeout=30)):
+        result = fm.bash(["sleep 999"])
+    assert "Error" in result
+    assert "timed out" in result.lower()
+
+
+# ── bash — integration tests (require WSL) ────────────────────────────────────
+
+import shutil as _shutil
+
+_wsl_available = pytest.mark.skipif(
+    _shutil.which("wsl.exe") is None,
+    reason="WSL not available"
+)
+
+
+@_wsl_available
+def test_bash_heredoc_backtick_literal(base):
+    """Backticks inside quoted heredoc must appear literally in file."""
+    fm = _fm(base)
+    cmd = "cat > out.md << 'EOF'\nUse `code` here\nEOF"
+    result = fm.bash([cmd])
+    assert "Error" not in result
+    content = (base / "out.md").read_text(encoding="utf-8")
+    assert "`code`" in content
+
+
+@_wsl_available
+def test_bash_heredoc_no_var_expansion(base):
+    """$VAR inside single-quoted heredoc must not expand."""
+    fm = _fm(base)
+    cmd = "cat > out.txt << 'EOF'\n$HOME should not expand\nEOF"
+    result = fm.bash([cmd])
+    assert "Error" not in result
+    content = (base / "out.txt").read_text(encoding="utf-8")
+    assert "$HOME" in content
+
+
+@_wsl_available
+def test_bash_multiline_output(base):
+    fm = _fm(base)
+    result = fm.bash(["printf 'line1\\nline2\\nline3'"])
+    assert "line1" in result
+    assert "line2" in result
+    assert "line3" in result
+
+
+@_wsl_available
+def test_bash_stderr_captured(base):
+    fm = _fm(base)
+    result = fm.bash(["ls /nonexistent_xyz_path_abc 2>&1"])
+    assert "No such file" in result or "cannot access" in result or "ls:" in result

@@ -8,7 +8,8 @@ def make_session(summary_text="This is a summary."):
     """ChatSession with mocked LLM that returns summary_text from get_response."""
     with patch("mcp_chatbot.core.session.load_settings", return_value={}), \
          patch("mcp_chatbot.core.session.SkillsManager"), \
-         patch("mcp_chatbot.core.session.TaskManager"):
+         patch("mcp_chatbot.core.session.TaskManager"), \
+         patch("mcp_chatbot.core.session.EpisodicStore"):
         llm = MagicMock(spec=LLMClient)
         llm.max_tokens = 4096
         llm.get_response.return_value = {"role": "assistant", "content": summary_text}

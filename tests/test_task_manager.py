@@ -204,7 +204,7 @@ def test_execute_plan_tasks(tmp_path):
 def test_execute_update_task(tmp_path):
     import json
     tm = _tm(tmp_path)
-    tm.plan_tasks(["A"])
+    tm.plan_tasks(["A","B"])
     tm.execute("update_task", {"id": "1", "status": "done"})
     data = json.loads((tmp_path / ".agent" / "tasks.json").read_text())
     assert data["tasks"][0]["status"] == "done"
@@ -330,3 +330,19 @@ def test_plan_tasks_warns_when_overwriting(tmp_path, caplog):
         tm.plan_tasks(["B"])
 
     assert any("replacing" in r.message.lower() for r in caplog.records)
+
+
+# ── _last_all_done flag ───────────────────────────────────────────────────────
+
+def test_last_all_done_false_when_tasks_remain(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", "B"])
+    tm.update_task("1", "done")
+    assert tm._last_all_done is False
+
+
+def test_last_all_done_true_when_all_tasks_done(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A"])
+    tm.update_task("1", "done")
+    assert tm._last_all_done is True

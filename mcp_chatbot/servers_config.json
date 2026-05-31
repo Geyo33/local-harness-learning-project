@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "memory-retrieval": {
+      "command": "uv",
+      "args": ["--directory", "memory_server", "run", "memory-retrieval"]
+    }
+  }
+}

@@ -14,10 +14,10 @@ class LLMClient:
         self.api_key: str = api_key
         self.model: str = model
         self.temp: float = temp
-        self.max_tokens = 20480
+        self.max_tokens = 32000
         self.frontend: str = frontend
         self.timeout = httpx.Timeout(
-            timeout=300.0,
+            timeout=600.0,
             read=60.0,
             write=30.0,
             connect=10.0,  

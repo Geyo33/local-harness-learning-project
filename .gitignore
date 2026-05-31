@@ -52,5 +52,4 @@ __pycache__/
 mcp_chatbot/log.json
 mcp_chatbot/logs_with_tasks.json
 mcp_chatbot/settings.json
-mcp_chatbot/servers_config.json
 mcp_chatbot/test.db

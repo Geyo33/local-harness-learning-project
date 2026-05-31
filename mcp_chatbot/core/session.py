@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 import time
@@ -15,6 +16,9 @@ from mcp_chatbot.tools.file_manager import FileManager
 from mcp_chatbot.settings import load_settings
 from mcp_chatbot.core.task_manager import TaskManager
 from mcp_chatbot.core.context_manager import ContextManager
+from mcp_chatbot.memory.store import EpisodicStore
+from mcp_chatbot.memory.memory_manager import MemoryManager
+from mcp_chatbot.memory.playbook import PlaybookManager
 
 
 MAX_PARSE_RETRIES = 3
@@ -70,8 +74,30 @@ class ChatSession:
             logging.warning("Could not initialize TaskManager: %s", e)
             self.task_manager = None
 
+        self._session_id: str = str(uuid.uuid4())
+        self.episodic_store: EpisodicStore | None = None
+        try:
+            db_path = Path(file_root) / ".agent" / "memory.db"
+            self.episodic_store = EpisodicStore(db_path)
+            logging.info("EpisodicStore initialized at: %s", db_path)
+        except Exception as e:
+            logging.warning("Could not initialize EpisodicStore: %s", e)
+
+        self.memory_manager: MemoryManager | None = None
+        if self.episodic_store:
+            self.memory_manager = MemoryManager(self.episodic_store)
+            logging.info("MemoryManager initialized.")
+
+        self.playbook_manager: PlaybookManager | None = None
+        try:
+            self.playbook_manager = PlaybookManager(task_root)
+            logging.info("PlaybookManager initialized at root: %s", task_root)
+        except Exception as e:
+            logging.warning("Could not initialize PlaybookManager: %s", e)
+
         self.planner_mode: str = settings.get("planner_mode", "auto")
         self.agent_loop = {"active": False, "state": ""}
+        self.load_episodes: bool = True
 
     async def list_servers(self) -> None:
         try:
@@ -109,6 +135,7 @@ class ChatSession:
             self._tool_timeout_map = {}
             self._active_skill = None
             self._injected_skill_schemas = []
+            settings = load_settings()
 
             for server in self.servers:
                 if self.active_servers[server.name]:
@@ -145,7 +172,7 @@ class ChatSession:
             # Load optional mission brief
             mission_brief = ""
             try:
-                plan_path = Path(load_settings().get("file_root") or ".") / "plan.md"
+                plan_path = Path(settings.get("file_root") or ".") / "plan.md"
                 if plan_path.exists():
                     mission_brief = "\n\n### Mission Brief\n\n" + plan_path.read_text(encoding="utf-8").strip()
                     logging.info("Loaded mission brief from %s", plan_path)
@@ -162,7 +189,6 @@ class ChatSession:
                     "For any multi-step request: call plan_tasks(titles) first if no plan exists. "
                     "Call update_task(id, in_progress) before starting each task; "
                     "update_task(id, done) when finished. "
-                    "If task block get messed up you can rebuild it using plan_tasks(titles)"
                     "plan_tasks and add_task require user approval. update_task runs silently."
                 )
 
@@ -172,19 +198,70 @@ class ChatSession:
                     "\n\n## Files\n"
                     "list_files runs silently, needs to be re-used to check sub-directories. "
                     "read_file shows numbered lines — use those line numbers with replace_lines for targeted edits. "
-                    "read_file, edit_file, replace_lines, and bash require approval. "
+                    "read_file, replace_lines, and bash require approval. "
                     "bash: each command is a separate, stateless WSL shell starting at base_dir — "
                     "chain dependent steps with && in a single command."
                 )
 
+            mcp_has_search = "search_memory" in self._tool_server_map
+
+            memory_tool_context = ""
+            if self.memory_manager:
+                search_note = (
+                    "\nsearch_memory uses the connected MCP server's retrieval."
+                    if mcp_has_search
+                    else "\nsearch_memory uses BM25 keyword retrieval locally."
+                )
+                memory_tool_context = (
+                    "\n\n## Memory Tools\n"
+                    "Key facts injected above show IDs — use those IDs directly with update_fact or forget_fact. "
+                    "search_memory runs silently — use it to search episodes and for facts beyond the displayed cap. "
+                    "remember_fact, update_fact, and forget_fact persist across sessions and require user approval."
+                    + search_note
+                )
+
+            memory_context = ""
+            if self.load_episodes and self.episodic_store:
+                n = settings.get("memory_episodes", 3)
+                episodes = await asyncio.to_thread(self.episodic_store.get_recent, n)
+                if episodes:
+                    lines = []
+                    for ep in episodes:
+                        date_str = datetime.datetime.fromtimestamp(ep["created_at"]).strftime("%Y-%m-%d")
+                        lines.append(f"\n<{date_str}> {ep['source'].title()}: {ep['summary']}\n")
+                    memory_context = "\n\n[Memory]:\n" + "\n".join(lines)
+
+            key_facts_context = ""
+            if self.episodic_store:
+                n_facts = settings.get("memory_key_facts", 20)
+                facts = await asyncio.to_thread(self.episodic_store.get_key_facts, n_facts)
+                if facts:
+                    fact_lines = [f"#{f['id']} {f['fact']}" for f in facts]
+                    key_facts_context = "\n\n[Key Facts]:\n" + "\n".join(fact_lines)
+
+            playbook_context = ""
+            if self.playbook_manager:
+                n = settings.get("playbook_top_n", 10)
+                block = self.playbook_manager.render_block(n)
+                if block:
+                    playbook_context = "\n\n" + block
+
             system_content = (
+                "--- SYSTEM INSTRUCTIONS ---\n\n"
+                "# INSTRUCTIONS\n\n"
                 f"{identity}"
-                f"Current date and time : {timestring}\n\n"
+                f"\nCurrent date and time : {timestring}\n\n"
                 "\nUse tools when they help; reply directly when they don't."
                 + task_context
                 + file_context
+                + memory_tool_context
                 + skills_prompt
                 + mission_brief
+                + "\n\n# CONTEXT AND MEMORY\n\n"
+                + memory_context
+                + key_facts_context
+                + playbook_context
+                + "\n\n--- SYSTEM INSTRUCTION END ---"
             )
 
             self.messages = [{"role": "user", "content": system_content}]
@@ -198,6 +275,20 @@ class ChatSession:
 
             if self.task_manager:
                 for schema in self.task_manager.tool_schemas:
+                    self._tool_schemas.append(schema)
+
+            if self.memory_manager:
+                memory_schemas = self.memory_manager.tool_schemas
+                if mcp_has_search:
+                    memory_schemas = [
+                        s for s in memory_schemas
+                        if s["function"]["name"] != "search_memory"
+                    ]
+                for schema in memory_schemas:
+                    self._tool_schemas.append(schema)
+
+            if self.playbook_manager:
+                for schema in self.playbook_manager.tool_schemas:
                     self._tool_schemas.append(schema)
 
             logging.info("Registered %d tool(s) and %d skill(s).", len(self._tool_schemas), len(skill_index))
@@ -221,7 +312,7 @@ class ChatSession:
         last = messages[-1]
         content = last["content"]
         if isinstance(content, str):
-            new_content = prefix + "\n\n" + content + "# IMPORTANT INSTRUCTION : NEVER ADD ANY ADDITIONAL TEXT OR COMMENTS WHEN CALLING TOOL(S) !!! You either call tool(s) or you speak, NEVER both at the same time."
+            new_content = prefix + "\n\n" + content
         else:
             new_content = [{"type": "text", "text": prefix}] + list(content)
         return messages[:-1] + [{**last, "content": new_content}]
@@ -293,6 +384,67 @@ class ChatSession:
 
         return False
 
+    async def _run_playbook_prompt(self):
+        """Fire a non-streaming LLM call offering record_procedure after all tasks complete."""
+        if not self.playbook_manager:
+            return
+
+        if not self.playbook_manager.tool_schemas:
+            return
+        record_schema = self.playbook_manager.tool_schemas[0]
+        prompt_messages = self.messages + [{
+            "role": "user",
+            "content": (
+                "[auto] All tasks completed. If this workflow is worth remembering as a "
+                "reusable procedure, call record_procedure(pattern, action) now. "
+                "pattern = the general situation that triggers this workflow. "
+                "action = the step-by-step approach taken. "
+                "This is meant to be a reusable procedure, avoid details and focus on the broader picture. "
+                "Always skip and don't call recorde_procedure if this was a one-off task."
+            ),
+        }]
+
+        try:
+            response = await asyncio.to_thread(
+                self.llm_client.get_response, prompt_messages, [record_schema]
+            )
+        except Exception as e:
+            logging.warning("Playbook auto-prompt failed: %s", e)
+            return
+
+        tool_calls = response.get("tool_calls")
+        if not tool_calls:
+            return
+
+        for tc in tool_calls:
+            if tc.get("function", {}).get("name") != "record_procedure":
+                continue
+            tool_arg = tc["function"].get("arguments", "{}")
+
+            self.tool_call_detected = True
+            yield "record_procedure", tool_arg
+            if self.allow_tool_action != "always":
+                self.allow_tool_event.clear()
+                await self.allow_tool_event.wait()
+
+            if self.allow_tool_action == "deny":
+                self.tool_call_detected = False
+                self.allow_tool_action = None
+                denial_text = "Playbook recording denied by user."
+                yield f"Tool call deniedo|o{tool_arg}o|o{denial_text}o|oFalse"
+                return
+
+            if self.allow_tool_action == "allow":
+                self.allow_tool_action = None
+
+            self.tool_call_detected = False
+            try:
+                args = json.loads(tool_arg or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result_text = self.playbook_manager.execute("record_procedure", args)
+            yield f"record_procedureo|o{tool_arg}o|o{result_text}o|oFalse"
+
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
         logging.info("Starting server cleanup...")
@@ -328,6 +480,18 @@ class ChatSession:
 
         if self.task_manager and name in self.task_manager.tool_names:
             return self.task_manager.execute(name, arguments)
+
+        if self.memory_manager:
+            _memory_names = (
+                self.memory_manager.tool_names - {"search_memory"}
+                if "search_memory" in self._tool_server_map
+                else self.memory_manager.tool_names
+            )
+            if name in _memory_names:
+                return self.memory_manager.execute(name, arguments)
+
+        if self.playbook_manager and name in self.playbook_manager.tool_names:
+            return self.playbook_manager.execute(name, arguments)
 
         if self.file_manager and name in self.file_manager.tool_names:
             return self.file_manager.execute(name, arguments)
@@ -518,8 +682,16 @@ class ChatSession:
                     self.task_manager is not None
                     and tool_name in self.task_manager.safe_tool_names
                 )
+                is_safe_memory_tool = (
+                    self.memory_manager is not None
+                    and tool_name in self.memory_manager.safe_tool_names
+                )
+                is_safe_playbook_tool = (
+                    self.playbook_manager is not None
+                    and tool_name in self.playbook_manager.safe_tool_names
+                )
 
-                if not (is_safe_file_tool or is_safe_task_tool):
+                if not (is_safe_file_tool or is_safe_task_tool or is_safe_memory_tool or is_safe_playbook_tool):
                     self.tool_call_detected = True
                     yield tool_name, tool_arg
                     if self.allow_tool_action != "always":
@@ -547,7 +719,7 @@ class ChatSession:
 
                 result_text = await self._execute_tool_call(tool_call)
 
-                yield f"{tool_name}o|o{json.dumps(tool_call)}o|o{result_text}o|o{str(is_safe_file_tool or is_safe_task_tool)}"
+                yield f"{tool_name}o|o{json.dumps(tool_call)}o|o{result_text}o|o{str(is_safe_file_tool or is_safe_task_tool or is_safe_memory_tool or is_safe_playbook_tool)}"
 
                 self.messages.append({
                     "role": "tool",
@@ -582,6 +754,14 @@ class ChatSession:
                         "Take the above tool call result into account.)"
                     )
                     self.messages.append({"role": "user", "content": nudge})
+                if (
+                    tool_name == "update_task"
+                    and self.task_manager is not None
+                    and self.task_manager._last_all_done
+                ):
+                    self.task_manager._last_all_done = False
+                    async for event in self._run_playbook_prompt():
+                        yield event
             self.tool_call_detected = False
 
     async def set_allow_tool_action(self, action: str, reason: str = "") -> None:
@@ -591,10 +771,41 @@ class ChatSession:
         self.allow_tool_event.set()
         logging.debug("set_allow_tool_action called with '%s'", action)
 
+    async def save_episode(self) -> None:
+        """Summarize the current session and persist it as an episode."""
+        if self.episodic_store is None:
+            return
+        history = self.messages[1:]
+        convo_length = [m for m in history]
+        if len(convo_length) < 10:
+            logging.info("Short session - Session episode not saved.")
+            return
+        def _summarize_and_save() -> bool:
+            summary = self._summarize(history)
+            if summary:
+                self.episodic_store.add_episode(self._session_id, summary, "agent")
+                return True
+            return False
+
+        try:
+            saved = await asyncio.to_thread(_summarize_and_save)
+            if saved:
+                logging.info("Session episode saved.")
+        except Exception as e:
+            logging.warning("Could not save session episode: %s", e)
+
     def _summarize(self, messages: list[dict]) -> str | None:
         """Summarize conversation history using the LLM."""
+        def _format_message(message):
+            content = message.get('content', '')
+            if isinstance(content, str):
+                return f"{message['role'].upper()}: {content}"
+            elif isinstance(content, list) and content:
+                text = content[0].get('text', '')
+                return f"{message['role'].upper()}: {text} (user submitted an image)"
+            return None
         text = "\n".join(
-            f"{m['role'].upper()}: {m.get('content', '')}"
+            _format_message(m)
             for m in messages
             if m.get("content")
         )
@@ -622,8 +833,10 @@ class ChatSession:
         cut = user_indices[-COMPRESSION_KEEP_TURNS]
         to_compress = history[:cut]
         to_keep = history[cut:]
-        # _summarize uses synchronous httpx
-        summary = self._summarize(to_compress)
+        try:
+            summary = await asyncio.to_thread(self._summarize, to_compress)
+        except Exception as e:
+            logging.warning("Could not compress messages into summary.: %s", e)
         if summary is None:
             return
         self.messages = (
@@ -632,3 +845,7 @@ class ChatSession:
             + to_keep
         )
         logging.info("Compressed %d messages into summary.", len(to_compress))
+        if self.episodic_store:
+            await asyncio.to_thread(
+                self.episodic_store.add_episode, self._session_id, summary, "agent"
+            )
