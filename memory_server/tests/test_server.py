@@ -290,12 +290,14 @@ def test_fuse_results_respects_limit():
 
 
 def test_format_results_empty():
-    assert server.format_results([]) == "No memory matches found."
+    assert server.format_results([], "anything") == (
+        "No memory matches found. Nothing useful in memory for the query: 'anything'."
+    )
 
 
 def test_format_results_formats_correctly():
     results = [_make_result(type_="episode", id_=1, text="test summary", created_at=1747612800.0, source="agent", score=1.0)]
-    output = server.format_results(results)
+    output = server.format_results(results, "test")
     assert "[episode#1" in output
     assert "agent" in output
     assert "test summary" in output
@@ -320,7 +322,7 @@ def test_search_memory_handler_no_results():
     server.init_db(conn)
     with patch.object(server, "embed_texts", return_value=None):
         result = server.search_memory_handler("nothing here", 10, db_path, "http://localhost:1234", "model")
-    assert result == "No memory matches found."
+    assert result == "No memory matches found. Nothing useful in memory for the query: 'nothing here'."
 
 
 def test_search_memory_handler_returns_keyword_results_when_embedding_fails():
