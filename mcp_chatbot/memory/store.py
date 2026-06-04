@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import re
 import sqlite3
 import time
 import logging
@@ -10,6 +12,7 @@ from pathlib import Path
 
 _FACT_SIMILARITY_THRESHOLD = 0.88
 _FACT_JACCARD_THRESHOLD = 0.5
+_PATTERN_SIMILARITY_THRESHOLD = 0.85
 
 
 def _fact_similar(a: str, b: str) -> bool:
@@ -26,13 +29,21 @@ _SOURCE_WEIGHT = {"user": 1.0, "agent": 0.7}  # decay weight, distinct from play
 _DECAY_LAMBDA = 0.01  # half-life ~70 days
 _MAX_KEY_FACTS_FETCH = 500
 
+_CONFIDENCE_BY_SOURCE = {
+    "task_success": 0.8,
+    "user": 1.0,
+    "agent": 0.6,
+}
+
 
 class EpisodicStore:
     def __init__(self, db_path: Path) -> None:
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
+        self._agent_dir = db_path.parent
         self._init_db()
+        self._migrate_playbook_json()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._path)
@@ -122,6 +133,49 @@ class EpisodicStore:
                     INSERT INTO key_facts_fts(rowid, fact)
                     SELECT kf.id, kf.fact FROM key_facts kf
                     WHERE kf.id NOT IN (SELECT rowid FROM key_facts_fts)
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS procedures (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pattern       TEXT NOT NULL,
+                        action        TEXT NOT NULL,
+                        confidence    REAL NOT NULL,
+                        source        TEXT NOT NULL,
+                        created_at    REAL NOT NULL,
+                        last_accessed REAL NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
+                        pattern, action,
+                        content='procedures',
+                        content_rowid='id'
+                    )
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS procedures_ai AFTER INSERT ON procedures BEGIN
+                        INSERT INTO procedures_fts(rowid, pattern, action)
+                            VALUES (new.id, new.pattern, new.action);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS procedures_ad AFTER DELETE ON procedures BEGIN
+                        INSERT INTO procedures_fts(procedures_fts, rowid, pattern, action)
+                            VALUES ('delete', old.id, old.pattern, old.action);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS procedures_au AFTER UPDATE ON procedures BEGIN
+                        INSERT INTO procedures_fts(procedures_fts, rowid, pattern, action)
+                            VALUES ('delete', old.id, old.pattern, old.action);
+                        INSERT INTO procedures_fts(rowid, pattern, action)
+                            VALUES (new.id, new.pattern, new.action);
+                    END
+                """)
+                conn.execute("""
+                    INSERT INTO procedures_fts(rowid, pattern, action)
+                    SELECT p.id, p.pattern, p.action FROM procedures p
+                    WHERE p.id NOT IN (SELECT rowid FROM procedures_fts)
                 """)
 
     def add_episode(
@@ -295,6 +349,190 @@ class EpisodicStore:
                     )
 
         return results
+
+    def record_procedure(self, pattern: str, action: str, source: str = "task_success") -> int:
+        """Insert or dedup-bump a procedure. Returns the row id."""
+        ts = time.time()
+        with closing(self._connect()) as conn:
+            cursor = conn.execute("SELECT id, pattern FROM procedures")
+            rows = cursor.fetchall()
+        for row_id, existing_pattern in rows:
+            if SequenceMatcher(None, pattern.lower(), existing_pattern.lower()).ratio() >= _PATTERN_SIMILARITY_THRESHOLD:
+                with closing(self._connect()) as conn:
+                    with conn:
+                        conn.execute(
+                            "UPDATE procedures SET confidence = MIN(1.0, confidence + 0.05), "
+                            "action = ?, last_accessed = ? WHERE id = ?",
+                            (action, ts, row_id),
+                        )
+                return row_id
+        confidence = _CONFIDENCE_BY_SOURCE.get(source, 0.6)
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO procedures (pattern, action, confidence, source, created_at, last_accessed) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pattern, action, confidence, source, ts, ts),
+                )
+                return cursor.lastrowid
+
+    def get_top_procedures(self, n: int) -> list[dict]:
+        """Return top-n procedures ranked by decay score."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "SELECT id, pattern, action, confidence, source, created_at, last_accessed FROM procedures"
+            )
+            rows = cursor.fetchall()
+        now = time.time()
+        scored = []
+        for r in rows:
+            days = (now - r[6]) / 86400.0
+            score = r[3] * math.exp(-_DECAY_LAMBDA * days)
+            scored.append((score, {
+                "id": r[0], "pattern": r[1], "action": r[2],
+                "confidence": r[3], "source": r[4], "created_at": r[5],
+            }))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[:n]]
+
+    def search_procedures(self, query: str, limit: int = 5) -> list[dict]:
+        """FTS5 BM25 search on procedures, re-ranked by confidence + disuse decay.
+
+        Query tokens are OR-joined: a procedure matches if it contains *any*
+        token (BM25 still ranks rows matching more tokens higher). This keeps
+        recall usable when the caller passes a full natural-language request
+        (e.g. the planner injection), where FTS5's default implicit-AND would
+        otherwise require every filler word to appear and match nothing.
+
+        Final ranking blends keyword relevance with the same confidence + decay
+        score as ``get_top_procedures`` / ``get_key_facts``
+        (``confidence * exp(-_DECAY_LAMBDA * days_since_last_accessed)``). This
+        is what lets the learning loop work: a procedure penalized by
+        ``adjust_confidence`` sinks in recall before it is pruned at the floor.
+        FTS gives a candidate pool; the decay-weighted score picks the winners.
+        """
+        # Quote each alnum token so FTS5 treats it as a literal, not an operator.
+        tokens = re.findall(r"\w+", query.lower())
+        fts_query = " OR ".join(f'"{t}"' for t in tokens)
+        # Pull a wider candidate pool than `limit` so the decay re-rank has room
+        # to demote stale/low-confidence matches below fresher, weaker-keyword ones.
+        pool = max(limit * 5, 25)
+        now = time.time()
+        results: list[dict] = []
+        with closing(self._connect()) as conn:
+            candidates: list[tuple[float, dict]] = []
+            try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty query")
+                # Weight the pattern column above action: the query resembles a
+                # trigger (pattern) more than a recipe (action), so a match in
+                # the trigger is a stronger relevance signal than one buried in
+                # the steps. Lower bm25 = better, hence ORDER BY ascending.
+                cursor = conn.execute(
+                    "SELECT p.id, p.pattern, p.action, p.confidence, p.source, p.created_at, "
+                    "p.last_accessed, bm25(procedures_fts, 5.0, 1.0) AS score "
+                    "FROM procedures_fts f JOIN procedures p ON p.id = f.rowid "
+                    "WHERE procedures_fts MATCH ? ORDER BY score LIMIT ?",
+                    (fts_query, pool),
+                )
+                rows = cursor.fetchall()
+                # Normalize bm25 (lower=better, often negative) to relevance in
+                # (0, 1]: the best match in the pool scores 1.0, others taper off.
+                best = rows[0][7] if rows else 0.0
+                for row in rows:
+                    rel = 1.0 / (1.0 + (row[7] - best))
+                    decay = row[3] * math.exp(-_DECAY_LAMBDA * (now - row[6]) / 86400.0)
+                    candidates.append((rel * decay, {
+                        "id": row[0], "pattern": row[1], "action": row[2],
+                        "confidence": row[3], "source": row[4], "created_at": row[5],
+                    }))
+            except sqlite3.OperationalError:
+                cursor = conn.execute(
+                    "SELECT id, pattern, action, confidence, source, created_at, last_accessed "
+                    "FROM procedures WHERE pattern LIKE ? OR action LIKE ? LIMIT ?",
+                    (f"%{query}%", f"%{query}%", pool),
+                )
+                for row in cursor.fetchall():
+                    # No keyword-relevance signal in the LIKE fallback — rank on
+                    # confidence + decay alone.
+                    decay = row[3] * math.exp(-_DECAY_LAMBDA * (now - row[6]) / 86400.0)
+                    candidates.append((decay, {
+                        "id": row[0], "pattern": row[1], "action": row[2],
+                        "confidence": row[3], "source": row[4], "created_at": row[5],
+                    }))
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            results = [item for _, item in candidates[:limit]]
+            proc_ids = [r["id"] for r in results]
+            if proc_ids:
+                try:
+                    with conn:
+                        conn.executemany(
+                            "UPDATE procedures SET last_accessed = ? WHERE id = ?",
+                            [(now, pid) for pid in proc_ids],
+                        )
+                except sqlite3.DatabaseError:
+                    logging.warning("Failed to refresh last_accessed for procedure ids %s", proc_ids)
+        return results
+
+    def adjust_confidence(self, ids: list[int], delta: float, floor: float = 0.1) -> None:
+        """Adjust confidence by delta for given ids; prune rows at or below floor."""
+        if not ids:
+            return
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.executemany(
+                    "UPDATE procedures SET confidence = MIN(1.0, MAX(0.0, confidence + ?)) WHERE id = ?",
+                    [(delta, pid) for pid in ids],
+                )
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM procedures WHERE id IN ({placeholders}) AND confidence <= ?",
+                    [*ids, floor],
+                )
+
+    def _migrate_playbook_json(self) -> None:
+        """One-time import of legacy playbook.json into the procedures table."""
+        legacy = self._agent_dir / "playbook.json"
+        migrated = self._agent_dir / "playbook.json.migrated"
+        if not legacy.exists() or migrated.exists():
+            return
+        with closing(self._connect()) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM procedures").fetchone()[0]
+        if count > 0:
+            legacy.rename(migrated)
+            return
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            procedures = data.get("procedures", [])
+        except Exception as e:
+            logging.warning("playbook.json migration: could not read legacy file: %s", e)
+            legacy.rename(migrated)  # don't retry a corrupt file every startup
+            return
+        imported = 0
+        if procedures:
+            with closing(self._connect()) as conn:
+                with conn:
+                    for p in procedures:
+                        try:
+                            ts = p.get("created_at", time.time())
+                            conn.execute(
+                                "INSERT INTO procedures "
+                                "(pattern, action, confidence, source, created_at, last_accessed) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (p["pattern"], p["action"], p.get("confidence", 0.8),
+                                 p.get("source", "task_success"), ts, ts),
+                            )
+                            imported += 1
+                        except (KeyError, TypeError) as e:
+                            logging.warning("playbook.json migration: skipping malformed entry: %s", e)
+            logging.info("Migrated %d procedures from playbook.json to memory.db", imported)
+        legacy.rename(migrated)
+
+    def clear_procedures(self) -> None:
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("DELETE FROM procedures")
+        logging.info("EpisodicStore: cleared all procedures")
 
     def clear_all(self) -> None:
         with closing(self._connect()) as conn:

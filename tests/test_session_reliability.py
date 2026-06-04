@@ -257,12 +257,15 @@ def test_inject_task_block_noop_when_no_task_manager():
     assert result == messages
 
 
-def test_inject_task_block_noop_when_block_empty():
+def test_inject_task_block_notice_when_block_empty():
     session = make_session()
     session.task_manager.render_block.return_value = ""
     messages = [{"role": "user", "content": "hello"}]
     result = session._inject_task_block(messages)
-    assert result == messages
+    # Empty plan -> LLM is told no task list exists yet (does not mutate input)
+    assert "No task list created" in result[0]["content"]
+    assert result[0]["content"].endswith("hello")
+    assert messages == [{"role": "user", "content": "hello"}]
 
 
 def test_inject_task_block_prepends_to_string_content():
@@ -270,7 +273,7 @@ def test_inject_task_block_prepends_to_string_content():
     session.task_manager.render_block.return_value = "<tasks>\n[ ] 1. A\n</tasks>"
     messages = [{"role": "user", "content": "hello"}]
     result = session._inject_task_block(messages)
-    assert result[-1]["content"].startswith("(System info - Here's the list of tasks you built")
+    assert result[-1]["content"].startswith("(System info - Here's the list of tasks you're working on")
     assert "hello" in result[-1]["content"]
 
 
@@ -289,7 +292,7 @@ def test_inject_task_block_prepends_to_multimodal_content():
     result = session._inject_task_block(messages)
     content = result[-1]["content"]
     assert isinstance(content, list)
-    assert content[0] == {"type": "text", "text": "(System info - Here's the list of tasks you built, never talk about it to the user, use tools to keep it up-to-date:\n <tasks>\n[ ] 1. A\n</tasks>)"}
+    assert content[0] == {"type": "text", "text": "(System info - Here's the list of tasks you're working on, never talk about it to the user, use tools to keep it up-to-date([ ]: pending, [~]: in_progress, [x]: done):\n <tasks>\n[ ] 1. A\n</tasks>)"}
     assert content[1] == {"type": "text", "text": "hello"}
 
 
@@ -304,7 +307,7 @@ def test_inject_task_block_only_modifies_last_message():
     result = session._inject_task_block(messages)
     assert result[0]["content"] == "first"
     assert result[1]["content"] == "second"
-    assert result[2]["content"].startswith("(System info - Here's the list of tasks you built")
+    assert result[2]["content"].startswith("(System info - Here's the list of tasks you're working on")
 
 
 def test_llm_called_with_injected_messages_not_originals():
@@ -493,7 +496,7 @@ def test_planner_pass_fires_on_auto_mode_complex_query():
 
     call_count = 0
 
-    def side_effect(messages, tools=None):
+    def side_effect(messages, tools=None, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1 and tools is not None and len(tools) == 1 and tools[0]["function"]["name"] == "plan_tasks":
@@ -530,7 +533,7 @@ def test_planner_pass_always_fires_for_simple_query():
 
     call_count = 0
 
-    def side_effect(messages, tools=None):
+    def side_effect(messages, tools=None, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1 and tools is not None and len(tools) == 1 and tools[0]["function"]["name"] == "plan_tasks":
@@ -556,7 +559,7 @@ def test_planner_pass_suppresses_hint():
     captured_messages = []
     call_count = 0
 
-    def side_effect(messages, tools=None):
+    def side_effect(messages, tools=None, **kwargs):
         nonlocal call_count
         call_count += 1
         captured_messages.extend(messages)

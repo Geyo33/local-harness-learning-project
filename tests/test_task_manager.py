@@ -94,13 +94,12 @@ def test_render_block_status_glyphs(tmp_path):
     from mcp_chatbot.core.task_manager import TaskManager
     tm = TaskManager(tmp_path)
     tm.plan_tasks(["A", "B", "C", "D"])
-    tm.update_task("1", "in_progress")
-    tm.update_task("2", "done")
-    tm.update_task("3", "cancelled")
+    tm.update_task("1", "done")
+    tm.update_task("2", "in_progress")
     block = tm.render_block()
-    assert "[~] 1. A" in block
-    assert "[x] 2. B" in block
-    assert "[-] 3. C" in block
+    assert "[x] 1. A" in block
+    assert "[~] 2. B" in block
+    assert "[ ] 3. C" in block
     assert "[ ] 4. D" in block
 
 
@@ -136,6 +135,73 @@ def test_update_task_returns_confirmation(tmp_path):
     result = tm.update_task("1", "done")
     assert "1" in result
     assert "done" in result
+
+
+# ── update_task ordering failsafe ─────────────────────────────────────────────
+
+def test_update_task_blocks_done_out_of_order(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", "B"])
+    result = tm.update_task("2", "done")
+    assert "Blocked" in result
+    assert "1" in result
+    # state unchanged
+    assert _read(tmp_path)["tasks"][1]["status"] == "pending"
+
+
+def test_update_task_blocks_in_progress_out_of_order(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", "B"])
+    result = tm.update_task("2", "in_progress")
+    assert "Blocked" in result
+    assert _read(tmp_path)["tasks"][1]["status"] == "pending"
+
+
+def test_update_task_allows_in_order_progression(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", "B"])
+    assert "Blocked" not in tm.update_task("1", "done")
+    assert "Blocked" not in tm.update_task("2", "in_progress")
+    assert "Blocked" not in tm.update_task("2", "done")
+
+
+def test_update_task_pending_reset_never_blocked(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", "B"])
+    # task 2 reset to pending while task 1 unfinished — allowed
+    assert "Blocked" not in tm.update_task("2", "pending")
+
+
+def test_update_step_blocks_done_out_of_order(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    result = tm.update_task("1.2", "done")
+    assert "Blocked" in result
+    assert "1.1" in result
+    assert _read(tmp_path)["tasks"][0]["steps"][1]["status"] == "pending"
+
+
+def test_update_step_blocks_in_progress_out_of_order(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    assert "Blocked" in tm.update_task("1.2", "in_progress")
+
+
+def test_update_step_allows_in_order(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    assert "Blocked" not in tm.update_task("1.1", "done")
+    assert "Blocked" not in tm.update_task("1.2", "in_progress")
+
+
+def test_ordering_independent_across_tasks(tmp_path):
+    # step ordering in task 2 is gated by task 2's own steps, not task 1's
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1"]}, {"title": "B", "steps": ["b1"]}])
+    tm.update_task("1.1", "done")  # task 1 auto-completes
+    # task 2's first step may now start/finish — first sibling, unblocked
+    assert "Blocked" not in tm.update_task("2.1", "in_progress")
+    assert "Blocked" not in tm.update_task("2.1", "done")
 
 
 # ── add_task ──────────────────────────────────────────────────────────────────
@@ -189,7 +255,7 @@ def test_add_task_returns_confirmation(tmp_path):
 
 def test_tool_names(tmp_path):
     tm = _tm(tmp_path)
-    assert tm.tool_names == {"plan_tasks", "update_task", "add_task"}
+    assert tm.tool_names == {"plan_tasks", "update_task", "add_task", "add_step"}
 
 
 # ── execute dispatcher ────────────────────────────────────────────────────────
@@ -229,30 +295,30 @@ def test_execute_unknown_tool_returns_error(tmp_path):
 
 def test_tool_schemas_returns_three_schemas(tmp_path):
     tm = _tm(tmp_path)
-    assert len(tm.tool_schemas) == 3
+    assert len(tm.tool_schemas) == 4
 
 
 def test_tool_schemas_names(tmp_path):
     tm = _tm(tmp_path)
     names = {s["function"]["name"] for s in tm.tool_schemas}
-    assert names == {"plan_tasks", "update_task", "add_task"}
+    assert names == {"plan_tasks", "update_task", "add_task", "add_step"}
 
 
 def test_tool_schemas_plan_tasks_has_titles_array(tmp_path):
     tm = _tm(tmp_path)
     schema = next(s for s in tm.tool_schemas if s["function"]["name"] == "plan_tasks")
     props = schema["function"]["parameters"]["properties"]
-    assert "titles" in props
-    assert props["titles"]["type"] == "array"
-    assert props["titles"]["items"]["type"] == "string"
-    assert "titles" in schema["function"]["parameters"]["required"]
+    assert "tasks" in props
+    assert props["tasks"]["type"] == "array"
+    assert props["tasks"]["items"]["type"] == "object"
+    assert "tasks" in schema["function"]["parameters"]["required"]
 
 
 def test_tool_schemas_update_task_has_enum_status(tmp_path):
     tm = _tm(tmp_path)
     schema = next(s for s in tm.tool_schemas if s["function"]["name"] == "update_task")
     props = schema["function"]["parameters"]["properties"]
-    assert set(props["status"]["enum"]) == {"pending", "in_progress", "done", "cancelled"}
+    assert set(props["status"]["enum"]) == {"pending", "in_progress", "done"}
     assert "id" in schema["function"]["parameters"]["required"]
     assert "status" in schema["function"]["parameters"]["required"]
 
@@ -346,3 +412,92 @@ def test_last_all_done_true_when_all_tasks_done(tmp_path):
     tm.plan_tasks(["A"])
     tm.update_task("1", "done")
     assert tm._last_all_done is True
+
+
+# ── steps ─────────────────────────────────────────────────────────────────────
+
+def _read(tmp_path):
+    import json
+    return json.loads((tmp_path / ".agent" / "tasks.json").read_text())
+
+
+def test_plan_tasks_with_steps(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}, "B"])
+    data = _read(tmp_path)
+    assert data["tasks"][0]["steps"][0]["id"] == "1.1"
+    assert data["tasks"][0]["steps"][1]["id"] == "1.2"
+    assert "steps" not in data["tasks"][1]
+
+
+def test_update_step_and_parent_auto_completes(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    tm.update_task("1.1", "done")
+    assert _read(tmp_path)["tasks"][0]["status"] == "pending"
+    msg = tm.update_task("1.2", "done")
+    assert "auto-completed" in msg
+    data = _read(tmp_path)
+    assert data["tasks"][0]["status"] == "done"
+    assert tm._last_all_done is True
+
+
+def test_marking_parent_done_cascades_to_steps(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    msg = tm.update_task("1", "done")
+    assert "2 step(s) also marked done" in msg
+    data = _read(tmp_path)
+    assert all(s["status"] == "done" for s in data["tasks"][0]["steps"])
+    assert tm._last_all_done is True
+
+
+def test_is_completed_false_when_steps_pending(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    tm.update_task("1.1", "done")
+    assert tm.is_completed(_read(tmp_path)) is False
+
+
+def test_update_unknown_step_returns_error(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1"]}])
+    assert "No step with id=1.9" in tm.update_task("1.9", "done")
+    assert "No task with id=9" in tm.update_task("9.1", "done")
+
+
+def test_add_step_appends_and_inserts(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1", "a2"]}])
+    tm.add_step("1", "a3")
+    assert [s["id"] for s in _read(tmp_path)["tasks"][0]["steps"]] == ["1.1", "1.2", "1.3"]
+    tm.add_step("1", "new", after="1.1")
+    steps = _read(tmp_path)["tasks"][0]["steps"]
+    assert [s["id"] for s in steps] == ["1.1", "1.2", "1.3", "1.4"]
+    assert steps[1]["title"] == "new"
+
+
+def test_add_step_to_stepless_task(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A"])
+    tm.add_step("1", "a1")
+    assert _read(tmp_path)["tasks"][0]["steps"][0]["id"] == "1.1"
+
+
+def test_add_task_renumbers_child_step_ids(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks(["A", {"title": "B", "steps": ["b1", "b2"]}])
+    tm.add_task("inserted", after="1")
+    data = _read(tmp_path)
+    # B shifted 2 -> 3; its steps must follow
+    b = next(t for t in data["tasks"] if t["title"] == "B")
+    assert b["id"] == "3"
+    assert [s["id"] for s in b["steps"]] == ["3.1", "3.2"]
+
+
+def test_render_block_renders_steps_indented(tmp_path):
+    tm = _tm(tmp_path)
+    tm.plan_tasks([{"title": "A", "steps": ["a1"]}])
+    block = tm.render_block()
+    assert "[ ] 1. A" in block
+    assert "  [ ] 1.1. a1" in block

@@ -33,7 +33,11 @@ async def setup_and_initialize():
         logging.info(f"server config: {server_config}")
         
         servers = [Server(name, srv_config) for name, srv_config in server_config["mcpServers"].items()] if server_config else []
-        llm_client = LLMClient(config.llm_api_key, config.model, config.temp, config.frontend)
+        _settings = load_settings()
+        llm_client = LLMClient(
+            config.llm_api_key, config.model, config.temp, config.frontend,
+            max_output_tokens=_settings.get("max_output_tokens", 4096),
+        )
         
         chat_session_initial = ChatSession(servers, llm_client)
 
@@ -232,17 +236,20 @@ def _render_task_html() -> str:
     for line in lines:
         if line.startswith("<tasks>") or line.startswith("</tasks>"):
             continue
-        if line.startswith("[ ]"):
-            icon, text = "⬜", line[3:].strip()
-        elif line.startswith("[~]"):
-            icon, text = "🔄", line[3:].strip()
-        elif line.startswith("[x]"):
-            icon, text = "✅", line[3:].strip()
-        elif line.startswith("[-]"):
-            icon, text = "❌", line[3:].strip()
+        is_step = line.startswith("  ")
+        stripped = line.strip()
+        if stripped.startswith("[ ]"):
+            icon, text = "⬜", stripped[3:].strip()
+        elif stripped.startswith("[~]"):
+            icon, text = "🔄", stripped[3:].strip()
+        elif stripped.startswith("[x]"):
+            icon, text = "✅", stripped[3:].strip()
         else:
             continue
-        rows.append(f'<div style="padding: 2px 0; font-size: 13px;">{icon} {text}</div>')
+        if is_step:
+            rows.append(f'<div style="padding: 1px 0 1px 20px; font-size: 12px; color: #6b7280;">{icon} {text}</div>')
+        else:
+            rows.append(f'<div style="padding: 2px 0; font-size: 13px;">{icon} {text}</div>')
     if not rows:
         return ""
     inner = "\n".join(rows)

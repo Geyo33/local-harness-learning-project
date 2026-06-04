@@ -1,101 +1,55 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
-import time
-from difflib import SequenceMatcher
-from pathlib import Path
 
-_PATTERN_SIMILARITY_THRESHOLD = 0.85
-
-
-def _similar(a: str, b: str) -> bool:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio() >= _PATTERN_SIMILARITY_THRESHOLD
-
-
-_CONFIDENCE_BY_SOURCE = {
-    "task_success": 0.8,
-    "user": 1.0,
-    "agent": 0.6,
-}
+from mcp_chatbot.memory.store import EpisodicStore
 
 
 class PlaybookManager:
-    def __init__(self, root: Path) -> None:
-        self._agent_dir = root / ".agent"
-        self._state_file = self._agent_dir / "playbook.json"
-        self._agent_dir.mkdir(parents=True, exist_ok=True)
-        if not self._state_file.exists():
-            self._write({"procedures": []})
-        else:
-            try:
-                data = json.loads(self._state_file.read_text(encoding="utf-8"))
-                if "procedures" not in data:
-                    raise ValueError("Missing 'procedures' key")
-            except (json.JSONDecodeError, ValueError):
-                logging.warning(
-                    "playbook.json at %s is corrupt — resetting.", self._state_file
-                )
-                self._write({"procedures": []})
-        logging.info("PlaybookManager initialized at %s", self._state_file)
+    def __init__(self, store: EpisodicStore) -> None:
+        self._store = store
+        logging.info("PlaybookManager initialized (store-backed).")
 
-    def _write(self, data: dict) -> None:
-        tmp = self._state_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, self._state_file)
-
-    def _read(self) -> dict:
-        try:
-            return json.loads(self._state_file.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {"procedures": []}
-        except json.JSONDecodeError:
-            logging.warning("playbook.json is corrupt — using empty playbook.")
-            return {"procedures": []}
-
-    def record(self, pattern: str, action: str, source: str) -> int:
-        data = self._read()
-        procedures = data["procedures"]
-        existing = next((p for p in procedures if _similar(p["pattern"], pattern)), None)
-        if existing:
-            existing["confidence"] = min(1.0, existing["confidence"] + 0.05)
-            existing["action"] = action
-            self._write(data)
-            return existing["id"]
-        new_id = max((p["id"] for p in procedures), default=0) + 1
-        procedures.append({
-            "id": new_id,
-            "pattern": pattern,
-            "action": action,
-            "confidence": _CONFIDENCE_BY_SOURCE.get(source, 0.7),
-            "source": source,
-            "created_at": time.time(),
-        })
-        self._write(data)
-        return new_id
+    def search(self, query: str, top_n: int = 5) -> list[dict]:
+        return self._store.search_procedures(query, limit=top_n)
 
     def get_top_n(self, n: int) -> list[dict]:
-        data = self._read()
-        return sorted(data["procedures"], key=lambda p: p["confidence"], reverse=True)[:n]
+        return self._store.get_top_procedures(n)
 
-    def render_block(self, n: int) -> str:
-        entries = self.get_top_n(n)
-        if not entries:
-            return ""
-        lines = [f"- [{e['source']}] {e['pattern']} → {e['action']}" for e in entries]
-        return "[Playbook]:\n" + "(Collection of successful procedures to apply in similar situations)\n\n" + "\n\n".join(lines)
+    # Base deltas; scaled per-procedure by the caller's attribution weights so the
+    # procedure the model actually followed moves more than the other candidates.
+    _PENALTY = -0.1
+    _REWARD = 0.05
+
+    def penalize(self, weights: dict[int, float]) -> None:
+        """Reduce confidence for procedures that preceded a failed/looping run.
+
+        ``weights`` maps procedure id -> attribution weight in (0, 1]; each id is
+        adjusted by ``_PENALTY * weight``."""
+        self._apply_weighted(weights, self._PENALTY)
+
+    def reinforce(self, weights: dict[int, float]) -> None:
+        """Boost confidence for procedures that preceded a successful run.
+
+        ``weights`` maps procedure id -> attribution weight in (0, 1]; each id is
+        adjusted by ``_REWARD * weight``."""
+        self._apply_weighted(weights, self._REWARD)
+
+    def _apply_weighted(self, weights: dict[int, float], base: float) -> None:
+        for pid, w in weights.items():
+            if w:
+                self._store.adjust_confidence([pid], base * w)
 
     def clear_all(self) -> None:
-        self._write({"procedures": []})
+        self._store.clear_procedures()
 
     @property
     def tool_names(self) -> set[str]:
-        return {"record_procedure"}
+        return {"record_procedure", "search_playbook"}
 
     @property
     def safe_tool_names(self) -> set[str]:
-        return set()
+        return {"search_playbook"}
 
     def execute(self, tool_name: str, arguments: dict) -> str:
         try:
@@ -106,8 +60,17 @@ class PlaybookManager:
                     return "Error: 'pattern' is required."
                 if not action:
                     return "Error: 'action' is required."
-                proc_id = self.record(pattern, action, source="task_success")
+                proc_id = self._store.record_procedure(pattern, action, source="task_success")
                 return f"Procedure #{proc_id} recorded: {pattern}"
+            if tool_name == "search_playbook":
+                query = arguments.get("query", "").strip()
+                if not query:
+                    return "Error: 'query' is required."
+                results = self._store.search_procedures(query, limit=5)
+                if not results:
+                    return "No matching procedures found."
+                lines = [f"#{p['id']} [{p['source']}] {p['pattern']} → {p['action']}" for p in results]
+                return "\n".join(lines)
             return f"Error: unknown playbook tool '{tool_name}'."
         except Exception as e:
             logging.error("PlaybookManager.%s error: %s", tool_name, e)
@@ -123,22 +86,56 @@ class PlaybookManager:
                     "description": (
                         "Record a reusable procedure in the playbook. "
                         "Call after completing a multi-step task that is likely to recur. "
-                        "pattern = the general situation; action = the step-by-step approach."
+                        "The pattern is the search key used to retrieve this procedure later, "
+                        "so make it keyword-rich; the action is the reusable recipe."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "pattern": {
                                 "type": "string",
-                                "description": "The general situation or trigger for this procedure, has to be short and concise.",
+                                "description": (
+                                    "A keyword-rich trigger describing the kind of request this "
+                                    "applies to, phrased the way a user would ask it. Include the "
+                                    "concrete nouns, tools, file types, and action verbs involved "
+                                    "(and common synonyms). This is the search key, so prefer "
+                                    "specific, varied keywords over short or abstract phrasing. "
+                                    "Generalize away one-off specifics (exact filenames, values) "
+                                    "but keep the domain vocabulary. "
+                                    "E.g. 'deploy / ship a docker container image to production, "
+                                    "push registry, restart service'."
+                                ),
                             },
                             "action": {
                                 "type": "string",
-                                "description": "The step-by-step approach to take.",
+                                "description": (
+                                    "The reusable step-by-step recipe. Generalize over-specific "
+                                    "values so it applies next time; concise but complete."
+                                ),
                             },
                         },
                         "required": ["pattern", "action"],
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_playbook",
+                    "description": (
+                        "Search for relevant past procedures by description or keyword. "
+                        "Call before planning a complex or recurring task."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Description of the task or situation to find procedures for.",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
         ]

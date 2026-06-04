@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,16 @@ from mcp_chatbot.memory.playbook import PlaybookManager
 
 
 MAX_PARSE_RETRIES = 3
+MAX_AGENT_ITERATIONS = 20
+AGENT_WALL_CLOCK_TIMEOUT = 900  # seconds; fallback default, override via settings.json["agent_timeout"]
+TIMEOUT_SYNTHESIS_BUDGET = 60  # seconds; bounded sub-call to synthesize a final answer on wall-clock abort
+# Procedure attribution: the planner injects the top-N candidate procedures but
+# the model typically follows only one. On reinforce/penalize we estimate which
+# by similarity of each procedure's action to the plan that actually ran; the
+# best match gets the full delta, the rest a reduced residual share.
+_PROC_ATTRIB_THRESHOLD = 0.12  # min token-Jaccard(plan, action) to trust attribution; else rank prior
+_PROC_RESIDUAL_FRAC = 0.3      # delta fraction applied to non-attributed injected procedures
+STALE_TASK_ITERATIONS = 5
 DEFAULT_TOOL_TIMEOUT = 30.0
 COMPRESSION_KEEP_TURNS = 4
 
@@ -89,15 +101,28 @@ class ChatSession:
             logging.info("MemoryManager initialized.")
 
         self.playbook_manager: PlaybookManager | None = None
-        try:
-            self.playbook_manager = PlaybookManager(task_root)
-            logging.info("PlaybookManager initialized at root: %s", task_root)
-        except Exception as e:
-            logging.warning("Could not initialize PlaybookManager: %s", e)
+        if self.episodic_store:
+            try:
+                self.playbook_manager = PlaybookManager(self.episodic_store)
+                logging.info("PlaybookManager initialized (store-backed).")
+            except Exception as e:
+                logging.warning("Could not initialize PlaybookManager: %s", e)
 
         self.planner_mode: str = settings.get("planner_mode", "auto")
+        # Wall-clock cap for the agentic loop (seconds). Local LLMs run far slower
+        # than cloud endpoints, so a single multi-step plan can legitimately exceed
+        # the 300s default; raise via settings.json["agent_timeout"] for local use.
+        self.agent_timeout: float = float(
+            settings.get("agent_timeout", AGENT_WALL_CLOCK_TIMEOUT)
+        )
+        # +0.05 reinforce on plan completion. Default on (current behavior);
+        # disable to avoid double-counting with the record_procedure dedup bump.
+        self.playbook_reinforce: bool = settings.get("playbook_reinforce", True)
         self.agent_loop = {"active": False, "state": ""}
         self.load_episodes: bool = True
+        # Plan-scoped: each entry {"id": int, "action": str}, in retrieval rank
+        # order. Drives weighted reinforce/penalize via _attribution_weights.
+        self._injected_procedures: list[dict] = []
 
     async def list_servers(self) -> None:
         try:
@@ -185,11 +210,14 @@ class ChatSession:
             if self.task_manager:
                 task_context = (
                     "\n\n## Tasks\n"
-                    "Tasks appear in <tasks> before each message. "
-                    "For any multi-step request: call plan_tasks(titles) first if no plan exists. "
-                    "Call update_task(id, in_progress) before starting each task; "
-                    "update_task(id, done) when finished. "
-                    "plan_tasks and add_task require user approval. update_task runs silently."
+                    "Tasks (and optional steps) appear in <tasks> before each message.\n"
+                    "Rules you MUST follow:\n"
+                    "- For any multi-step request (3+ actions): ALWAYS call plan_tasks first.\n"
+                    "- ALWAYS call update_task(id, 'in_progress') before starting each task or step.\n"
+                    "- ALWAYS call update_task(id, 'done') when each task or step finishes.\n"
+                    "- Keep only ONE task or step in_progress at a time.\n"
+                    "- Completed tasks stay visible while the plan is in progress; do not remove "
+                    "them yourself. The whole plan clears automatically once every task/step is done.\n"
                 )
 
             file_context = ""
@@ -197,8 +225,9 @@ class ChatSession:
                 file_context = (
                     "\n\n## Files\n"
                     "list_files runs silently, needs to be re-used to check sub-directories. "
-                    "read_file shows numbered lines — use those line numbers with replace_lines for targeted edits. "
-                    "read_file, replace_lines, and bash require approval. "
+                    "read_file shows numbered lines (N | line) — for targeted edits use edit_file, copying the exact text to change into 'find' (no line numbers) and the new text into 'replace'; 'find' must match exactly once. "
+                    "For large changes that rewrite most of a file, don't chain many edit_file calls — rewrite the whole file in one bash command (cat > file <<'EOF' … EOF). "
+                    "read_file, edit_file, and bash require approval. "
                     "bash: each command is a separate, stateless WSL shell starting at base_dir — "
                     "chain dependent steps with && in a single command."
                 )
@@ -239,12 +268,12 @@ class ChatSession:
                     fact_lines = [f"#{f['id']} {f['fact']}" for f in facts]
                     key_facts_context = "\n\n[Key Facts]:\n" + "\n".join(fact_lines)
 
-            playbook_context = ""
+            playbook_hint = ""
             if self.playbook_manager:
-                n = settings.get("playbook_top_n", 10)
-                block = self.playbook_manager.render_block(n)
-                if block:
-                    playbook_context = "\n\n" + block
+                playbook_hint = (
+                    "\n\n## Playbook\n"
+                    "Call search_playbook(query) to retrieve relevant past procedures before planning."
+                )
 
             system_content = (
                 "--- SYSTEM INSTRUCTIONS ---\n\n"
@@ -252,7 +281,9 @@ class ChatSession:
                 f"{identity}"
                 f"\nCurrent date and time : {timestring}\n\n"
                 "\nUse tools when they help; reply directly when they don't."
+                "\nWrite a short and concise one sentence description of what you're trying to accomplish before calling tools."
                 + task_context
+                + playbook_hint
                 + file_context
                 + memory_tool_context
                 + skills_prompt
@@ -260,7 +291,6 @@ class ChatSession:
                 + "\n\n# CONTEXT AND MEMORY\n\n"
                 + memory_context
                 + key_facts_context
-                + playbook_context
                 + "\n\n--- SYSTEM INSTRUCTION END ---"
             )
 
@@ -305,7 +335,9 @@ class ChatSession:
         if hint:
             prefix_parts.append(hint)
         if block:
-            prefix_parts.append("(System info - Here's the list of tasks you built, never talk about it to the user, use tools to keep it up-to-date:\n "+block+")")
+            prefix_parts.append("(System info - Here's the list of tasks you're working on, never talk about it to the user, use tools to keep it up-to-date([ ]: pending, [~]: in_progress, [x]: done):\n "+block+")")
+        elif self.task_manager is not None and not hint:
+            prefix_parts.append("(System info - No task list created. Call plan_tasks if the request needs a multi-step plan.)")
         if not prefix_parts:
             return messages
         prefix = "\n\n".join(prefix_parts)
@@ -353,19 +385,45 @@ class ChatSession:
                 if isinstance(p, dict) and p.get("type") == "text"
             )
 
+        procedure_block = ""
+        # A planner pass produces a fresh plan, so the injected-procedure set is
+        # reset here (plan-scoped, not turn-scoped): the ids persist across the
+        # later turns that execute the same plan so reinforce/penalize can still
+        # fire when a multi-turn plan completes or aborts.
+        self._injected_procedures = []
+        if self.playbook_manager:
+            matches = self.playbook_manager.search(text, top_n=3)
+            if matches:
+                self._injected_procedures = [
+                    {"id": p["id"], "action": p.get("action", "")} for p in matches
+                ]
+                lines = [f"- {p['pattern']} → {p['action']}" for p in matches]
+                procedure_block = (
+                    "[Relevant procedures from memory — consider these when building the task plan]:\n"
+                    + "\n".join(lines)
+                    + "\n\n"
+                )
+
         planner_messages = [
             {
                 "role": "user",
                 "content": (
-                    "You are a task planner. Your only job is to call the plan_tasks tool with a list of "
-                    "short, actionable task titles for the following request. Do nothing else.\n\n"
+                    f"{procedure_block}"
+                    "You are a task planner. Your only job is to call the plan_tasks tool "
+                    "with an ordered list of tasks for the following request. "
+                    "Each task may have an optional 'steps' list for sub-actions. "
+                    "Do nothing else.\n\n"
                     f"Request: {text}"
                 ),
             }
         ]
 
         tool_calls = None
-        for event in self.llm_client.stream_response(planner_messages, tools=[plan_schema]):
+        for event in self.llm_client.stream_response(
+            planner_messages,
+            tools=[plan_schema],
+            tool_choice={"type": "function", "function": {"name": "plan_tasks"}},
+        ):
             if event["type"] == "tool_calls_final":
                 tool_calls = event["data"]
 
@@ -395,12 +453,14 @@ class ChatSession:
         prompt_messages = self.messages + [{
             "role": "user",
             "content": (
-                "[auto] All tasks completed. If this workflow is worth remembering as a "
-                "reusable procedure, call record_procedure(pattern, action) now. "
-                "pattern = the general situation that triggers this workflow. "
-                "action = the step-by-step approach taken. "
-                "This is meant to be a reusable procedure, avoid details and focus on the broader picture. "
-                "Always skip and don't call recorde_procedure if this was a one-off task."
+                "[auto] All tasks completed. If this workflow is likely to recur and is "
+                "worth reusing, call record_procedure(pattern, action) now.\n"
+                "pattern = a keyword-rich trigger for this kind of request, phrased the way a "
+                "user would ask it — include the key nouns, tools, file types, and verbs (and "
+                "synonyms) so future searches can find it. Keep the domain keywords; drop only "
+                "one-off specifics (exact filenames, values).\n"
+                "action = the generalized step-by-step recipe.\n"
+                "Skip and call nothing if this was a one-off task unlikely to repeat."
             ),
         }]
 
@@ -517,6 +577,85 @@ class ChatSession:
             logging.error(error_msg)
             return error_msg
 
+    def _attribution_weights(self) -> dict[int, float]:
+        """Estimate which injected procedure the model actually followed and
+        return per-id weights in (0, 1].
+
+        The planner shows the top-N candidates but the model usually leans on one.
+        We compare each procedure's action text against the plan that actually ran
+        (token-Jaccard): the best match above ``_PROC_ATTRIB_THRESHOLD`` is treated
+        as the one used (full weight 1.0) and the rest get ``_PROC_RESIDUAL_FRAC``
+        — non-zero so a procedure that is repeatedly injected-but-never-matched
+        still slowly decays. With no plan text or no clear match we fall back to a
+        rank prior (``1/(rank+1)``): better-ranked retrievals get more weight."""
+        procs = self._injected_procedures
+        if not procs:
+            return {}
+        plan_text = self.task_manager.plan_text() if self.task_manager else ""
+        if not isinstance(plan_text, str):
+            plan_text = ""
+        plan_tokens = set(re.findall(r"\w+", plan_text.lower()))
+
+        best_idx, best_score = -1, 0.0
+        if plan_tokens:
+            for i, p in enumerate(procs):
+                a_tokens = set(re.findall(r"\w+", (p.get("action") or "").lower()))
+                if not a_tokens:
+                    continue
+                union = plan_tokens | a_tokens
+                score = len(plan_tokens & a_tokens) / len(union) if union else 0.0
+                if score > best_score:
+                    best_idx, best_score = i, score
+
+        if best_idx >= 0 and best_score >= _PROC_ATTRIB_THRESHOLD:
+            return {
+                p["id"]: (1.0 if i == best_idx else _PROC_RESIDUAL_FRAC)
+                for i, p in enumerate(procs)
+            }
+        return {p["id"]: 1.0 / (i + 1) for i, p in enumerate(procs)}
+
+    def _penalize_injected_procedures(self) -> None:
+        """Penalize the procedures injected into the current plan after a
+        loop-safety abort, then clear the set so a later unrelated abort cannot
+        re-penalize the same ids. Weighted by attribution so the procedure the
+        model actually followed takes the brunt, not every shown candidate."""
+        if self._injected_procedures and self.playbook_manager:
+            self.playbook_manager.penalize(self._attribution_weights())
+        self._injected_procedures = []
+
+    def _reinforce_injected_procedures(self) -> None:
+        """Reinforce the procedures injected into the current plan when it
+        completes, then clear the set. Gated by ``playbook_reinforce`` so the
+        +0.05 bump can be disabled if it double-counts with the record dedup
+        bump (Phase 10.4). Attribution-weighted like the penalty path."""
+        if self.playbook_reinforce and self._injected_procedures and self.playbook_manager:
+            self.playbook_manager.reinforce(self._attribution_weights())
+        self._injected_procedures = []
+
+    async def _synthesize_on_timeout(self) -> str:
+        """Best-effort final answer when the wall-clock cap fires. Runs a
+        non-streaming synthesis call in a thread bounded by
+        ``TIMEOUT_SYNTHESIS_BUDGET`` so a slow/hung backend (the likely cause of
+        the timeout) cannot hang the abort path too. Returns the synthesized text,
+        or "" on timeout/error so the caller can fall back to a plain message."""
+        synthesis_msgs = self.messages + [{
+            "role": "user",
+            "content": (
+                "(System: time budget exceeded. Stop calling tools. "
+                "Summarize what was accomplished so far and give a best-effort "
+                "final answer based on the work done.)"
+            ),
+        }]
+        try:
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(self.llm_client.get_response, synthesis_msgs, None),
+                timeout=TIMEOUT_SYNTHESIS_BUDGET,
+            )
+            return (msg.get("content") or "").strip()
+        except Exception as e:
+            logging.warning("Timeout synthesis failed: %s", e)
+            return ""
+
     async def handle_user_input(self, user_input: str | list[dict[str, Any]]):
         """
         Handles one turn of conversation from an external source (e.g. Gradio).
@@ -562,9 +701,48 @@ class ChatSession:
         parse_retries = 0  # tracks consecutive malformed-JSON tool call responses
         messages_checkpoint = len(self.messages)
         _compressed_this_turn = False
+        _turn_count = 0
+        _fingerprints: list[str] = []
+        _wall_start = time.time()
+        _stale_count = 0
+        _last_in_progress_hash: str | None = None
 
         while True:
             self.agent_loop = {"active": True, "state": ""}
+            _turn_count += 1
+            if _turn_count > MAX_AGENT_ITERATIONS:
+                self._penalize_injected_procedures()
+                synthesis_msgs = self.messages + [{
+                    "role": "user",
+                    "content": (
+                        "(System: maximum iterations reached. "
+                        "Summarize what was accomplished and give a best-effort final answer. "
+                        "Do not call any more tools.)"
+                    ),
+                }]
+                synthesis_text = ""
+                for event in self.llm_client.stream_response(synthesis_msgs, tools=None):
+                    if event["type"] == "content":
+                        synthesis_text += event["data"]
+                        yield event["data"]
+                if synthesis_text:
+                    self.messages.append({"role": "assistant", "content": synthesis_text})
+                self.agent_loop = {"active": False, "state": ""}
+                return
+            if time.time() - _wall_start > self.agent_timeout:
+                self._penalize_injected_procedures()
+                self.agent_loop["state"] = "synthesizing"
+                synthesis_text = await self._synthesize_on_timeout()
+                if synthesis_text:
+                    yield synthesis_text
+                    self.messages.append({"role": "assistant", "content": synthesis_text})
+                else:
+                    yield (
+                        f"Error: agent timed out after {self.agent_timeout:.0f} seconds "
+                        "and could not synthesize a summary."
+                    )
+                self.agent_loop = {"active": False, "state": ""}
+                return
             tools = self._tool_schemas or None
             with open("mcp_chatbot/log.json", "w") as f:
                 json.dump(self.messages, f, indent=2)
@@ -574,6 +752,28 @@ class ChatSession:
             tool_args = {}
             call_messages = self._inject_task_block(self.messages, hint=_hint)
             _hint = ""  # consume — subsequent iterations don't repeat hint
+
+            if self.task_manager:
+                ip_ids = self.task_manager.get_in_progress_ids()
+                current_ip_hash = str(ip_ids)
+                if ip_ids:
+                    if current_ip_hash == _last_in_progress_hash:
+                        _stale_count += 1
+                        if _stale_count >= STALE_TASK_ITERATIONS:
+                            ids_str = ", ".join(ip_ids)
+                            stale_nudge = (
+                                f"[System: task {ids_str} has been in_progress for several steps "
+                                "without an update — update it or re-plan.]"
+                            )
+                            call_messages = call_messages + [{"role": "user", "content": stale_nudge}]
+                            _stale_count = 0
+                    else:
+                        _stale_count = 0
+                    _last_in_progress_hash = current_ip_hash
+                else:
+                    _stale_count = 0
+                    _last_in_progress_hash = None
+
             with open("mcp_chatbot/logs_with_tasks.json", "w") as f:
                 json.dump(call_messages, f, indent=2)
             breakdown = self.context_mgr.snapshot(call_messages, tools or [])
@@ -627,11 +827,13 @@ class ChatSession:
 
                 if parse_error is not None:
                     if parse_retries >= MAX_PARSE_RETRIES:
+                        self._penalize_injected_procedures()
                         del self.messages[messages_checkpoint:]
                         yield (
                             f"Error: LLM produced invalid tool call JSON after "
                             f"{MAX_PARSE_RETRIES} retries. Aborting."
                         )
+                        self.agent_loop = {"active": False, "state": ""}
                         return
                     parse_retries += 1
                     logging.warning(
@@ -666,8 +868,16 @@ class ChatSession:
                     json.dump(self.messages, f, indent=2)
                 break
 
-            if assistant_msg:
-                self.messages.append({"role": "assistant", "content": assistant_msg})
+            # Persist the assistant turn WITH its tool_calls. Required so the
+            # following role:tool messages can be paired back to their call —
+            # strict templates (e.g. Gemma) only render tool results by
+            # forward-scanning from an assistant message that carries
+            # tool_calls; without it the results are invisible to the model.
+            self.messages.append({
+                "role": "assistant",
+                "content": assistant_msg or "",
+                "tool_calls": tool_calls,
+            })
 
             for tool_call in tool_calls:
                 tool_name = tool_call["function"]["name"]
@@ -702,7 +912,7 @@ class ChatSession:
                         self.tool_call_detected = False
                         self.allow_tool_action = None
                         with_reason = f" Reason for denying tool call: {self.deny_reason}"
-                        denial_text = f"**Result:**\nTool call was denied by user.\n\n**Arguments:**\n```json\n{tool_arg}\n```"
+                        denial_text = f"\nTool call '{tool_name}' was denied by user.\n\n**Arguments:**\n```json\n{tool_arg}\n```"
                         yield f"Tool call deniedo|o{tool_arg}o|o{denial_text}o|oFalse"
                         self.messages.append({
                             "role": "tool",
@@ -718,6 +928,17 @@ class ChatSession:
                     self.tool_call_detected = False
 
                 result_text = await self._execute_tool_call(tool_call)
+
+                # Include tool_arg so distinct calls (e.g. search_playbook with
+                # different queries that all return "no match") don't collide as
+                # a false loop. A genuine stuck loop repeats name+args+result.
+                _fp = hashlib.md5(f"{tool_name}:{tool_arg}:{result_text[:120]}".encode()).hexdigest()
+                _fingerprints.append(_fp)
+                if len(_fingerprints) >= 3 and len(set(_fingerprints[-3:])) == 1:
+                    self._penalize_injected_procedures()
+                    yield "Error: agent stuck in loop (same tool + result 3 consecutive times). Aborting."
+                    self.agent_loop = {"active": False, "state": ""}
+                    return
 
                 yield f"{tool_name}o|o{json.dumps(tool_call)}o|o{result_text}o|o{str(is_safe_file_tool or is_safe_task_tool or is_safe_memory_tool or is_safe_playbook_tool)}"
 
@@ -749,9 +970,7 @@ class ChatSession:
                         self.messages.append({"role": "user", "content": nudge})
                 else:
                     nudge = (
-                        "(System instruction - If more tool calls are needed, call them now with no text. "
-                        "If all tasks are complete, give your final answer. "
-                        "Take the above tool call result into account.)"
+                        "(System instruction - Take the above tool call result into account.)"
                     )
                     self.messages.append({"role": "user", "content": nudge})
                 if (
@@ -759,9 +978,11 @@ class ChatSession:
                     and self.task_manager is not None
                     and self.task_manager._last_all_done
                 ):
+                    self._reinforce_injected_procedures()
                     self.task_manager._last_all_done = False
                     async for event in self._run_playbook_prompt():
                         yield event
+                    self.task_manager.clear_plan()
             self.tool_call_detected = False
 
     async def set_allow_tool_action(self, action: str, reason: str = "") -> None:

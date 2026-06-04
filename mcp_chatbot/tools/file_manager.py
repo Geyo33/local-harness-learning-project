@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from pathlib import Path
 import subprocess
 
@@ -14,7 +15,7 @@ class FileManager:
     - .gitignore patterns deny read and write access.
     """
 
-    _TOOL_NAMES = {"list_files", "read_file", "bash", "replace_lines"}
+    _TOOL_NAMES = {"list_files", "read_file", "bash", "edit_file"}
 
     def __init__(self, base_dir: Path) -> None:
         if not base_dir.exists():
@@ -116,17 +117,29 @@ class FileManager:
             content = resolved.read_text(encoding="utf-8")
             lines = content.splitlines(keepends=False)
             width = len(str(len(lines)))
-            numbered = "".join(f"{i + 1:>{width}} | '{line}'\n" for i, line in enumerate(lines))
+            numbered = "".join(f"{i + 1:>{width}} | {line}\n" for i, line in enumerate(lines))
             plural = "" if len(lines) == 1 else "s"
             return f"Successfully read from '{path}' ({len(lines)} line{plural})\nContent:\n{numbered}"
         except Exception as e:
             return f"Error reading '{path}': {e}"
 
-    def replace_lines(self, path: str, edits: list[dict]) -> str:
+    @staticmethod
+    def _strip_gutter(text: str) -> str:
+        """Remove a read_file-style 'N | ' line-number gutter (and any wrapping
+        quotes) the model may have copied into find. Returns the cleaned text."""
+        out = []
+        for ln in text.split("\n"):
+            s = re.sub(r"^\s*\d+\s*\|\s?", "", ln)
+            if len(s) >= 2 and s[0] in "'\"" and s[-1] == s[0]:
+                s = s[1:-1]
+            out.append(s)
+        return "\n".join(out)
+
+    def edit_file(self, path: str, find: str, replace: str) -> str:
         if not path or not path.strip():
             return (
-                "Error: no 'path' provided. replace_lines requires the relative file "
-                "path as the first argument. Retry with path set."
+                "Error: no 'path' provided. edit_file requires the relative file "
+                "path. Retry with path set."
             )
         resolved, err = self._check(path)
         if err:
@@ -135,104 +148,55 @@ class FileManager:
             return f"Error: '{path}' does not exist."
         if not resolved.is_file():
             return f"Error: '{path}' is not a file."
-        if not edits:
-            return "Error: edits list is empty."
+        if not find.strip():
+            return "Error: 'find' is empty. Provide the exact text to locate."
         try:
             # newline="" disables newline translation so EOLs round-trip unchanged
             with open(resolved, "r", encoding="utf-8", newline="") as f:
                 content = f.read()
         except Exception as e:
             return f"Error reading '{path}': {e}"
-        lines = content.splitlines(keepends=True)
-        total = len(lines)
 
-        # Validate all edits before touching the file (all-or-nothing)
-        for i, edit in enumerate(edits):
-            start = edit.get("start_line", 0)
-            end = edit.get("end_line", 0)
-            if start < 1:
-                return f"Error: edit {i} start_line must be >= 1."
-            if end < start:
-                return f"Error: edit {i} end_line ({end}) must be >= start_line ({start})."
-            if start > total:
-                return (
-                    f"Error: edit {i} start_line ({start}) is beyond the file's "
-                    f"line count ({total})."
-                )
-            expected = edit.get("expected")
-            if expected is None:
-                return (
-                    f"Error: edit {i} missing required 'expected' "
-                    "(the exact current lines being replaced)."
-                )
-            if not isinstance(expected, list):
-                return (
-                    f"Error: edit {i} 'expected' must be an array of strings "
-                    "(one element per line), not a single string."
-                )
-            end_clamped = min(end, total)
-            actual = [lines[j].rstrip("\r\n") for j in range(start - 1, end_clamped)]
-            if actual != expected:
-                return (
-                    f"Error: edit {i} 'expected' does not match file lines "
-                    f"{start}-{end_clamped}.\n"
-                    "File has:\n"
-                    + "\n".join(f"{start + k} | {a!r}" for k, a in enumerate(actual))
-                    + "\nYou sent:\n"
-                    + "\n".join(f"{e!r}" for e in expected)
-                    + "\nRe-read the file and retry with the exact lines "
-                    "(including indentation)."
-                )
-
-        # Sort descending by start_line; clamp end_line to file length
-        sorted_edits = sorted(
-            enumerate(edits),
-            key=lambda x: x[1]["start_line"],
-            reverse=True,
-        )
-        clamped = [
-            (orig_i, e["start_line"], min(e["end_line"], total), e.get("new_lines", []))
-            for orig_i, e in sorted_edits
-        ]
-
-        # Overlap check: sorted descending, so clamped[i+1] sits above clamped[i]
-        for i in range(len(clamped) - 1):
-            curr_orig_i, curr_start, curr_end, _ = clamped[i]
-            next_orig_i, next_start, next_end, _ = clamped[i + 1]
-            if next_end >= curr_start:
-                return (
-                    f"Error: edits {next_orig_i} and {curr_orig_i} overlap "
-                    f"(lines {next_start}-{next_end} and {curr_start}-{curr_end})."
-                )
-
-        # Detect the file's EOL so new lines match its convention (avoid mixed EOLs)
+        # Detect EOL, match on \n-normalized copies (so multi-line find works on CRLF)
         eol = "\r\n" if "\r\n" in content else "\r" if "\r" in content else "\n"
-        had_trailing_nl = content.endswith(("\n", "\r"))
 
-        # Apply bottom-up (sorted descending = bottom of file first)
-        for _, start, end, new_lines in clamped:
-            before = lines[: start - 1]
-            after = lines[end:]
-            if not new_lines:
-                new_segment: list[str] = []
-            else:
-                joined = eol.join(new_lines)
-                if after:
-                    new_segment = [joined + eol]
-                else:
-                    # segment now ends the file: match the file's original EOF state
-                    new_segment = [joined + (eol if had_trailing_nl else "")]
-            lines = before + new_segment + after
+        def _norm(s: str) -> str:
+            return s.replace("\r\n", "\n").replace("\r", "\n")
 
+        content_n = _norm(content)
+        find_n = _norm(find)
+        replace_n = _norm(replace)
+
+        if replace_n == find_n:
+            return "Error: 'replace' is identical to 'find' — no change to make."
+
+        matched = find_n
+        count = content_n.count(find_n)
+        if count == 0:
+            # Defensive: model may have copied a 'N | ' gutter from read_file.
+            stripped = self._strip_gutter(find_n)
+            if stripped and stripped != find_n and content_n.count(stripped) == 1:
+                matched = stripped
+                count = 1
+        if count == 0:
+            return (
+                f"Error: find text not found in '{path}'. "
+                "Re-read the file and copy the exact text (no line numbers)."
+            )
+        if count > 1:
+            return (
+                f"Error: find text found {count} times in '{path}'. "
+                "Add surrounding lines to make it unique."
+            )
+
+        new_content_n = content_n.replace(matched, replace_n, 1)
+        out = new_content_n.replace("\n", eol)
         try:
             with open(resolved, "w", encoding="utf-8", newline="") as f:
-                f.write("".join(lines))
+                f.write(out)
         except Exception as e:
             return f"Error writing '{path}': {e}"
-
-        n = len(edits)
-        final_content = "".join(lines)
-        return f"Applied {n} edit(s) to '{path}'. New line count: {len(final_content.splitlines())}."
+        return f"Applied edit to '{path}'."
 
     def bash(self, commands: list[str]) -> str:
         if not commands:
@@ -261,10 +225,11 @@ class FileManager:
                 return self.list_files(arguments.get("path", ""))
             if tool_name == "read_file":
                 return self.read_file(arguments.get("path", ""))
-            if tool_name == "replace_lines":
-                return self.replace_lines(
+            if tool_name == "edit_file":
+                return self.edit_file(
                     arguments.get("path", ""),
-                    arguments.get("edits", []),
+                    arguments.get("find", ""),
+                    arguments.get("replace", ""),
                 )
             if tool_name == "bash":
                 return self.bash(arguments.get("commands", []))
@@ -380,20 +345,18 @@ With an unquoted EOF, backtick expressions inside the body are executed as comma
                 "schema": {
                     "type": "function",
                     "function": {
-                        "name": "replace_lines",
+                        "name": "edit_file",
                         "description": (
-                            "Replace one or more line ranges in an existing file. "
-                            "ALWAYS call read_file first to get current line numbers and content. "
-                            "Specify start_line through end_line (1-indexed, inclusive). "
-                            "For each edit you MUST echo the exact current lines in 'expected' — "
-                            "copy them verbatim from read_file (including all leading indentation); "
-                            "the tool rejects the edit if 'expected' does not match the file. "
-                            "Preserve indentation in new_lines too. "
-                            "Pass all targeted edits for a file in a single call. "
-                            "Set new_lines to an empty array to delete lines. "
-                            "Each element is one line — no newline characters needed. "
-                            "Use \"\" as an element for a blank line. "
-                            "end_line beyond the last line is clamped silently."
+                            "Edit a file by replacing an exact piece of text. "
+                            "ALWAYS call read_file first. Copy the 'find' text VERBATIM "
+                            "from the file — do NOT include the 'N | ' line numbers. "
+                            "Include enough surrounding lines so 'find' appears EXACTLY "
+                            "ONCE in the file (the tool errors if it matches zero or "
+                            "multiple places). Preserve all indentation in both 'find' "
+                            "and 'replace'. Set 'replace' to an empty string to delete "
+                            "the found text. For a large change that rewrites most of a "
+                            "file, prefer rewriting the whole file with the bash tool "
+                            "(cat > file <<'EOF' … EOF) instead of many edit_file calls."
                         ),
                         "parameters": {
                             "type": "object",
@@ -402,37 +365,16 @@ With an unquoted EOF, backtick expressions inside the body are executed as comma
                                     "type": "string",
                                     "description": "Relative path to the file to edit.",
                                 },
-                                "edits": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "start_line": {
-                                                "type": "integer",
-                                                "description": "1-indexed first line of the range to replace (inclusive).",
-                                            },
-                                            "end_line": {
-                                                "type": "integer",
-                                                "description": "1-indexed last line of the range to replace (inclusive).",
-                                            },
-                                            "expected": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                                "description": "The EXACT current lines being replaced (1 element per line, no newline chars, include all leading whitespace). Tool verifies this against the file and rejects the edit on mismatch. Copy verbatim from read_file output.",
-                                            },
-                                            "new_lines": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                                "description": "Replacement lines. Each element is one line — no newline characters needed. Preserve exact indentation (⚠️ include all leading spaces or tabs ⚠️). Use \"\" for a blank line. Empty array deletes the range.",
-                                            },
-                                        },
-                                        "required": ["start_line", "end_line", "expected", "new_lines"],
-                                    },
-                                    "description": "List of line-range edits to apply. All edits applied atomically.",
+                                "find": {
+                                    "type": "string",
+                                    "description": "Exact text to locate, copied verbatim from the file (no line numbers, keep indentation). Must be unique in the file.",
+                                },
+                                "replace": {
+                                    "type": "string",
+                                    "description": "Replacement text (keep indentation). Empty string deletes the found text.",
                                 },
                             },
-                            "required": ["path", "edits"],
+                            "required": ["path", "find", "replace"],
                         },
                     },
                 },

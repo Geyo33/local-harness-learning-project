@@ -183,6 +183,41 @@ def keyword_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dic
                 "created_at": r[2], "source": r[3], "score": 1.0,
             })
 
+    # FTS5 on procedures
+    try:
+        cursor = conn.execute(
+            "SELECT p.id, p.pattern, p.action, p.created_at, p.source, f.rank "
+            "FROM procedures_fts f JOIN procedures p ON p.id = f.rowid "
+            "WHERE procedures_fts MATCH ? ORDER BY f.rank LIMIT ?",
+            (query, limit),
+        )
+        rows = cursor.fetchall()
+        if rows:
+            ranks = [r[5] for r in rows]
+            min_r, max_r = min(ranks), max(ranks)
+            rng = max_r - min_r
+            for r in rows:
+                score = (max_r - r[5]) / rng if rng != 0.0 else 0.5
+                results.append({
+                    "type": "procedure", "id": r[0], "text": f"{r[1]} → {r[2]}",
+                    "created_at": r[3], "source": r[4], "score": score,
+                })
+    except sqlite3.OperationalError as e:
+        logging.warning("procedures_fts unavailable, falling back to LIKE search: %s", e)
+        try:
+            cursor = conn.execute(
+                "SELECT id, pattern, action, created_at, source FROM procedures "
+                "WHERE pattern LIKE ? OR action LIKE ? LIMIT ?",
+                (f"%{query}%", f"%{query}%", limit),
+            )
+            for r in cursor.fetchall():
+                results.append({
+                    "type": "procedure", "id": r[0], "text": f"{r[1]} → {r[2]}",
+                    "created_at": r[3], "source": r[4], "score": 1.0,
+                })
+        except sqlite3.OperationalError:
+            pass  # procedures table not yet available on this DB
+
     return results
 
 def entity_boost(results: list[dict], query: str, nlp) -> list[dict]:
