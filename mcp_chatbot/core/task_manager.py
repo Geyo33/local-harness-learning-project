@@ -101,7 +101,11 @@ class TaskManager:
             title = t if isinstance(t, str) else t["title"]
             step_titles = [] if isinstance(t, str) else t.get("steps", [])
             steps = [
-                {"id": f"{task_id}.{j + 1}", "title": st, "status": "pending"}
+                {
+                    "id": f"{task_id}.{j + 1}",
+                    "title": st if isinstance(st, str) else (st.get("title") or ""),
+                    "status": "pending",
+                }
                 for j, st in enumerate(step_titles)
             ]
             entry = {"id": task_id, "title": title, "status": "pending"}
@@ -289,7 +293,7 @@ class TaskManager:
                                         "steps": {
                                             "type": "array",
                                             "items": {"type": "string"},
-                                            "description": "Optional ordered sub-steps (≤80 chars each).",
+                                            "description": "Optional ordered sub-steps. Each item is a PLAIN STRING (≤80 chars), NOT an object.",
                                         },
                                     },
                                     "required": ["title"],

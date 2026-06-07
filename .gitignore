@@ -48,7 +48,10 @@ __pycache__/
 .coverage
 
 # resources
-.agent
+.agent/memory.db
+.agent/memory.db-shm
+.agent/memory.db-wal
+.agent/tasks.json
 mcp_chatbot/log.json
 mcp_chatbot/logs_with_tasks.json
 mcp_chatbot/settings.json

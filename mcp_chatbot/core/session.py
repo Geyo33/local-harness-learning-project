@@ -124,6 +124,38 @@ class ChatSession:
         # order. Drives weighted reinforce/penalize via _attribution_weights.
         self._injected_procedures: list[dict] = []
 
+    def reinitialize_root(self, root: Path) -> None:
+        """Reinitialize all file-root-dependent components when the root changes."""
+        try:
+            self.file_manager = FileManager(root)
+        except Exception as e:
+            logging.warning("Could not reinitialize FileManager: %s", e)
+            self.file_manager = None
+
+        try:
+            self.task_manager = TaskManager(root)
+        except Exception as e:
+            logging.warning("Could not reinitialize TaskManager: %s", e)
+            self.task_manager = None
+
+        try:
+            db_path = root / ".agent" / "memory.db"
+            self.episodic_store = EpisodicStore(db_path)
+        except Exception as e:
+            logging.warning("Could not reinitialize EpisodicStore: %s", e)
+            self.episodic_store = None
+
+        if self.episodic_store:
+            self.memory_manager = MemoryManager(self.episodic_store)
+            try:
+                self.playbook_manager = PlaybookManager(self.episodic_store)
+            except Exception as e:
+                logging.warning("Could not reinitialize PlaybookManager: %s", e)
+                self.playbook_manager = None
+        else:
+            self.memory_manager = None
+            self.playbook_manager = None
+
     async def list_servers(self) -> None:
         try:
             for server in self.servers:
@@ -194,17 +226,17 @@ class ChatSession:
             else:
                 skills_prompt = ""
 
-            # Load optional mission brief
+            # Load optional workspace guide
             mission_brief = ""
             try:
-                plan_path = Path(settings.get("file_root") or ".") / "plan.md"
+                plan_path = Path(settings.get("file_root") or ".") / ".agent" / "workspace.md"
                 if plan_path.exists():
-                    mission_brief = "\n\n### Mission Brief\n\n" + plan_path.read_text(encoding="utf-8").strip()
-                    logging.info("Loaded mission brief from %s", plan_path)
+                    mission_brief = "\n\n### Workspace Guide\n\n" + plan_path.read_text(encoding="utf-8").strip()
+                    logging.info("Loaded workspace guide from %s", plan_path)
                 else:
-                    logging.info("Optional mission brief not loaded, %s doesn't exist", plan_path)
+                    logging.info("Optional workspace guide not loaded, %s doesn't exist", plan_path)
             except Exception as e:
-                logging.warning("Could not load plan.md: %s", e)
+                logging.warning("Could not load workspace.md: %s", e)
 
             task_context = ""
             if self.task_manager:
@@ -218,6 +250,8 @@ class ChatSession:
                     "- Keep only ONE task or step in_progress at a time.\n"
                     "- Completed tasks stay visible while the plan is in progress; do not remove "
                     "them yourself. The whole plan clears automatically once every task/step is done.\n"
+                    # "- Use steps (via plan_tasks 'steps' field or add_step) for tasks with 3+ sub-actions.\n"
+                    # "- plan_tasks, add_task, and add_step require user approval. update_task runs silently."
                 )
 
             file_context = ""
@@ -293,6 +327,9 @@ class ChatSession:
                 + key_facts_context
                 + "\n\n--- SYSTEM INSTRUCTION END ---"
             )
+
+            with open("system_prompt_log.md", "w", encoding="utf-8") as f:
+                f.write(system_content)
 
             self.messages = [{"role": "user", "content": system_content}]
 
@@ -873,6 +910,7 @@ class ChatSession:
             # strict templates (e.g. Gemma) only render tool results by
             # forward-scanning from an assistant message that carries
             # tool_calls; without it the results are invisible to the model.
+            # Also the OpenAI spec mandates this ordering.
             self.messages.append({
                 "role": "assistant",
                 "content": assistant_msg or "",
@@ -970,6 +1008,9 @@ class ChatSession:
                         self.messages.append({"role": "user", "content": nudge})
                 else:
                     nudge = (
+                        # "(System instruction - If more tool calls are needed, call them now with no text. "
+                        # "If all tasks are complete, give your final answer. "
+                        # "(System instruction - If more tool calls are needed, call them now with no text. "
                         "(System instruction - Take the above tool call result into account.)"
                     )
                     self.messages.append({"role": "user", "content": nudge})

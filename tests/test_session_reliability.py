@@ -589,10 +589,11 @@ def test_planner_pass_skipped_when_plan_exists():
     session.task_manager.execute.assert_not_called()
 
 
-# ── Mission Brief (plan.md) ───────────────────────────────────────────────────
+# ── Workspace Guide (workspace.md) ────────────────────────────────────────────
 
 def test_mission_brief_injected_when_plan_md_exists(tmp_path):
-    plan_md = tmp_path / "plan.md"
+    (tmp_path / ".agent").mkdir()
+    plan_md = tmp_path / ".agent" / "workspace.md"
     plan_md.write_text("We are building X. Constraints: Y.", encoding="utf-8")
 
     from mcp_chatbot.core.session import ChatSession
@@ -615,12 +616,12 @@ def test_mission_brief_injected_when_plan_md_exists(tmp_path):
         asyncio.run(s.build_system_message())
 
         system_msg = s.messages[0]["content"]
-        assert "Mission Brief" in system_msg
+        assert "Workspace Guide" in system_msg
         assert "We are building X." in system_msg
 
 
 def test_mission_brief_absent_when_no_plan_md(tmp_path):
-    # No plan.md in tmp_path
+    # No workspace.md in tmp_path
 
     from mcp_chatbot.core.session import ChatSession
     from mcp_chatbot.core.llm_client import LLMClient
@@ -642,11 +643,11 @@ def test_mission_brief_absent_when_no_plan_md(tmp_path):
         asyncio.run(s.build_system_message())
 
         system_msg = s.messages[0]["content"]
-        assert "Mission Brief" not in system_msg
+        assert "Workspace Guide" not in system_msg
 
 
 def test_mission_brief_reloads_on_build_system_message(tmp_path):
-    """Second call to build_system_message picks up an updated plan.md."""
+    """Second call to build_system_message picks up an updated workspace.md."""
     from mcp_chatbot.core.session import ChatSession
     from mcp_chatbot.core.llm_client import LLMClient
 
@@ -664,12 +665,52 @@ def test_mission_brief_reloads_on_build_system_message(tmp_path):
         s.task_manager.tool_names = set()
         s.active_servers = {}
 
-        # First call — no plan.md
+        # First call — no workspace.md
         asyncio.run(s.build_system_message())
-        assert "Mission Brief" not in s.messages[0]["content"]
+        assert "Workspace Guide" not in s.messages[0]["content"]
 
-        # Create plan.md and rebuild
-        (tmp_path / "plan.md").write_text("New mission.", encoding="utf-8")
+        # Create .agent/workspace.md and rebuild
+        (tmp_path / ".agent").mkdir(exist_ok=True)
+        (tmp_path / ".agent" / "workspace.md").write_text("New guide.", encoding="utf-8")
         asyncio.run(s.build_system_message())
-        assert "Mission Brief" in s.messages[0]["content"]
-        assert "New mission." in s.messages[0]["content"]
+        assert "Workspace Guide" in s.messages[0]["content"]
+        assert "New guide." in s.messages[0]["content"]
+
+
+# ── reinitialize_root ─────────────────────────────────────────────────────────
+
+def test_reinitialize_root_creates_agent_dir(tmp_path):
+    """Fresh dir gets .agent/ created and all managers initialized."""
+    session = make_session()
+    new_root = tmp_path / "workspace"
+    new_root.mkdir()
+
+    session.reinitialize_root(new_root)
+
+    assert (new_root / ".agent").is_dir()
+    assert session.file_manager is not None
+    assert session.task_manager is not None
+    assert session.episodic_store is not None
+    assert session.memory_manager is not None
+    assert session.playbook_manager is not None
+
+
+def test_reinitialize_root_switches_to_new_root(tmp_path):
+    """Second reinitialize_root replaces managers; new root's .agent/ is created."""
+    session = make_session()
+
+    root1 = tmp_path / "root1"
+    root1.mkdir()
+    root2 = tmp_path / "root2"
+    root2.mkdir()
+
+    session.reinitialize_root(root1)
+    assert (root1 / ".agent").is_dir()
+    old_task_manager = session.task_manager
+
+    session.reinitialize_root(root2)
+
+    assert (root2 / ".agent").is_dir()
+    assert session.task_manager is not old_task_manager
+    assert session.file_manager is not None
+    assert session.episodic_store is not None

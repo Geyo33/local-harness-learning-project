@@ -9,7 +9,6 @@ from pathlib import Path
 import logging
 from mcp_chatbot.frontend.multimodal import build_content_array, IMAGE_EXTENSIONS
 from mcp_chatbot.settings import load_settings, save_settings
-from mcp_chatbot.tools.file_manager import FileManager
 
 
 class GradioChat:
@@ -217,11 +216,11 @@ async def save_file_root(path: str):
     current["file_root"] = path
     save_settings(current)
     try:
-        chat_session.session.file_manager = FileManager(p)
+        chat_session.session.reinitialize_root(p)
         await chat_session.session.build_system_message()
         return f"Saved. File tools active at: `{path}`"
     except Exception as e:
-        return f"Saved to disk, but error activating FileManager: {e}"
+        return f"Saved to disk, but error reinitializing root: {e}"
 
 # --- Logic Functions ---
 
@@ -556,7 +555,9 @@ def build_app():
             save_file_root,
             inputs=file_root_input,
             outputs=file_root_status,
-        )
+        ).success(load_memory_tab, outputs=[memory_list, facts_list]
+        ).success(load_playbook_tab, outputs=playbook_list
+        ).success(show_memory_choice, outputs=[memory_choice_md, memory_choice_row, msg_input])
 
         planner_mode_radio.change(save_planner_mode, inputs=planner_mode_radio, outputs=planner_mode_status)
 
