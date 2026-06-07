@@ -20,7 +20,7 @@ Built to understand how LLM agent loops, tool orchestration, task planning, cont
 - **Bash tool** — runs commands via WSL (`wsl.exe bash -s`, passed via stdin); Windows paths auto-mapped to `/mnt/...`
 - **Skills system** — extend the LLM with specialised instructions or callable Python functions via `mcp_chatbot/skills/`
 - **Multimodal input** — accepts text files and images alongside chat messages
-- **Mission brief** — static `plan.md` in workspace root injected into every system prompt
+- **Workspace guide** — static `.agent/workspace.md` injected into every system prompt
 - **Token budget tracker** — per-category token estimates (system / tools / history); triggers rolling summarization at 70% context
 - **Rolling summarization** — compresses old turns into a `[Summary]:` block to keep context within limits
 - **Token usage display** — segmented progress bar in UI showing system / tools / history usage with color thresholds
