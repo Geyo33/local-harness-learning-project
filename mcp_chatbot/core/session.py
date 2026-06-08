@@ -36,6 +36,10 @@ _PROC_RESIDUAL_FRAC = 0.3      # delta fraction applied to non-attributed inject
 STALE_TASK_ITERATIONS = 5
 DEFAULT_TOOL_TIMEOUT = 30.0
 COMPRESSION_KEEP_TURNS = 4
+# Appended to the assistant bubble (and persisted to history) when the user
+# interrupts a turn via the stop button. Kept as one constant so the yielded
+# display string and the persisted history marker can never drift apart.
+STOPPED_MARKER = "_[Stopped by user]_"
 
 
 class ChatSession:
@@ -119,10 +123,19 @@ class ChatSession:
         # disable to avoid double-counting with the record_procedure dedup bump.
         self.playbook_reinforce: bool = settings.get("playbook_reinforce", True)
         self.agent_loop = {"active": False, "state": ""}
+        self.interrupt_requested: bool = False
         self.load_episodes: bool = True
         # Plan-scoped: each entry {"id": int, "action": str}, in retrieval rank
         # order. Drives weighted reinforce/penalize via _attribution_weights.
+        # Populated two ways: the planner pass sets it directly; a model-issued
+        # search_playbook + plan_tasks commits the turn buffer below into it.
         self._injected_procedures: list[dict] = []
+        # Turn-scoped buffer of procedures the model looked up via search_playbook
+        # this turn (same {id, action} shape as above). Committed into
+        # _injected_procedures when the model calls plan_tasks, so self-retrieved
+        # procedures feed the same reinforce/penalize loop the planner-injected
+        # ones do. Reset each turn.
+        self._retrieved_procedures: list[dict] = []
 
     def reinitialize_root(self, root: Path) -> None:
         """Reinitialize all file-root-dependent components when the root changes."""
@@ -588,6 +601,20 @@ class ChatSession:
                 return self.memory_manager.execute(name, arguments)
 
         if self.playbook_manager and name in self.playbook_manager.tool_names:
+            if name == "search_playbook":
+                query = (arguments.get("query") or "").strip()
+                if not query:
+                    return "Error: 'query' is required."
+                # Single query: full dicts render the result string; the buffer
+                # keeps only {id, action} to match the _injected_procedures
+                # contract (line 128) the planner path also follows.
+                results = self.playbook_manager.search(query)
+                seen = {p["id"] for p in self._retrieved_procedures}
+                self._retrieved_procedures.extend(
+                    {"id": p["id"], "action": p.get("action", "")}
+                    for p in results if p["id"] not in seen
+                )
+                return self.playbook_manager.render_results(results)
             return self.playbook_manager.execute(name, arguments)
 
         if self.file_manager and name in self.file_manager.tool_names:
@@ -664,7 +691,7 @@ class ChatSession:
         """Reinforce the procedures injected into the current plan when it
         completes, then clear the set. Gated by ``playbook_reinforce`` so the
         +0.05 bump can be disabled if it double-counts with the record dedup
-        bump (Phase 10.4). Attribution-weighted like the penalty path."""
+        bump. Attribution-weighted like the penalty path."""
         if self.playbook_reinforce and self._injected_procedures and self.playbook_manager:
             self.playbook_manager.reinforce(self._attribution_weights())
         self._injected_procedures = []
@@ -726,6 +753,11 @@ class ChatSession:
 
         self.messages.append({"role": "user", "content": user_input})
 
+        self.interrupt_requested = False
+        if self.allow_tool_action == "interrupt":
+            self.allow_tool_action = None
+            self.allow_tool_event.clear()
+
         if self._active_skill:
             for s in self._injected_skill_schemas:
                 try:
@@ -736,6 +768,10 @@ class ChatSession:
             self._active_skill = None
 
         parse_retries = 0  # tracks consecutive malformed-JSON tool call responses
+        # Reset only the search buffer, not _injected_procedures: a plan in
+        # progress from a prior turn (model paused to ask the user, then resumes)
+        # must keep its tracked procedures so they are still scored on completion.
+        self._retrieved_procedures = []
         messages_checkpoint = len(self.messages)
         _compressed_this_turn = False
         _turn_count = 0
@@ -747,6 +783,10 @@ class ChatSession:
         while True:
             self.agent_loop = {"active": True, "state": ""}
             _turn_count += 1
+            if self.interrupt_requested:
+                self._abort_interrupt("")
+                yield f"\n\n{STOPPED_MARKER}"
+                return
             if _turn_count > MAX_AGENT_ITERATIONS:
                 self._penalize_injected_procedures()
                 synthesis_msgs = self.messages + [{
@@ -827,6 +867,8 @@ class ChatSession:
             self.agent_loop["state"] = "streaming"
             for event in self.llm_client.stream_response(call_messages, tools=tools):
                 if event["type"] == "content":
+                    if self.interrupt_requested:
+                        break
                     assistant_msg += event["data"]
                     yield event["data"]
                 elif event["type"] == "tool_name":
@@ -843,6 +885,11 @@ class ChatSession:
             logging.debug("tool_args: %s", tool_args)
             self.agent_loop["state"] = ""
 
+            if self.interrupt_requested:
+                self._abort_interrupt(assistant_msg)
+                yield f"\n\n{STOPPED_MARKER}"
+                return
+
             # pop the "Use the above tool call result..." nudge from the previous iteration
             if (
                 self.messages
@@ -856,8 +903,16 @@ class ChatSession:
             if tool_calls:
                 parse_error: Exception | None = None
                 for tc in tool_calls:
+                    # Normalize empty/whitespace argument strings to "{}". An empty
+                    # "arguments": "" is invalid in the OpenAI tool-call format;
+                    # local backends (LM Studio / llama.cpp) reject the whole
+                    # history with HTTP 500 when re-serializing such a turn, which
+                    # poisons every subsequent call since the bad assistant message
+                    # stays in self.messages. Rewrite it before it is persisted.
+                    if not (tc["function"].get("arguments") or "").strip():
+                        tc["function"]["arguments"] = "{}"
                     try:
-                        json.loads(tc["function"].get("arguments", "{}") or "{}")
+                        json.loads(tc["function"]["arguments"])
                     except json.JSONDecodeError as e:
                         parse_error = e
                         break
@@ -917,7 +972,20 @@ class ChatSession:
                 "tool_calls": tool_calls,
             })
 
-            for tool_call in tool_calls:
+            for _idx, tool_call in enumerate(tool_calls):
+                if self.interrupt_requested:
+                    # Pair every not-yet-executed call in this round so the
+                    # appended assistant{tool_calls} entry has no orphaned ids
+                    # (strict templates / OpenAI spec require a result per call).
+                    for _pending in tool_calls[_idx:]:
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": _pending.get("id", _pending["function"]["name"]),
+                            "content": "Tool call skipped — stopped by user.",
+                        })
+                    self._abort_interrupt("")
+                    yield f"\n\n{STOPPED_MARKER}"
+                    return
                 tool_name = tool_call["function"]["name"]
                 tool_arg = tool_call["function"]["arguments"]
                 logging.info("Attempting Tool Call: %s", tool_name)
@@ -942,9 +1010,35 @@ class ChatSession:
                 if not (is_safe_file_tool or is_safe_task_tool or is_safe_memory_tool or is_safe_playbook_tool):
                     self.tool_call_detected = True
                     yield tool_name, tool_arg
-                    if self.allow_tool_action != "always":
+                    if self.allow_tool_action not in ("always", "interrupt") and not self.interrupt_requested:
                         self.allow_tool_event.clear()
                         await self.allow_tool_event.wait()
+
+                    if self.interrupt_requested or self.allow_tool_action == "interrupt":
+                        # Reuse the deny path so the already-appended
+                        # assistant{tool_calls} entry gets a paired tool result,
+                        # then abort the whole loop. Clear tool_call_detected
+                        # BEFORE yielding the o|o string — handle_chat checks the
+                        # tool_call_detected branch first and would otherwise try
+                        # to unpack this string as a (name, args) tuple.
+                        self.tool_call_detected = False
+                        denial_text = (
+                            f"\nTool call '{tool_name}' was stopped by the user.\n\n"
+                            f"**Arguments:**\n```json\n{tool_arg}\n```"
+                        )
+                        yield f"Tool call deniedo|o{tool_arg}o|o{denial_text}o|oFalse"
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", tool_name),
+                            "content": denial_text,
+                        })
+                        self.messages.append({
+                            "role": "user",
+                            "content": "Reason for stopping: Stopped by user.",
+                        })
+                        self._abort_interrupt("")
+                        yield f"\n\n{STOPPED_MARKER}"
+                        return
 
                     if self.allow_tool_action == "deny":
                         self.tool_call_detected = False
@@ -966,6 +1060,16 @@ class ChatSession:
                     self.tool_call_detected = False
 
                 result_text = await self._execute_tool_call(tool_call)
+
+                # A fresh plan supersedes any prior attribution tracking: the
+                # procedures the model looked up this turn (buffer) become the
+                # plan-scoped set scored on completion/abort. Empty buffer (planned
+                # without searching) correctly clears stale ids. Note: a plan_tasks
+                # issued after the planner pass already seeded _injected_procedures
+                # will overwrite it — acceptable, the model replaced that plan.
+                if tool_name == "plan_tasks":
+                    self._injected_procedures = self._retrieved_procedures
+                    self._retrieved_procedures = []
 
                 # Include tool_arg so distinct calls (e.g. search_playbook with
                 # different queries that all return "no match") don't collide as
@@ -1033,6 +1137,43 @@ class ChatSession:
         self.allow_tool_event.set()
         logging.debug("set_allow_tool_action called with '%s'", action)
 
+    async def request_interrupt(self) -> None:
+        """Request a cooperative abort of the current agent turn. No-op when no
+        turn is active (so a stray click cannot leak a sentinel into the next
+        turn's approval gate). Sets the gate event so a pending approval wait
+        unblocks and is handled as an interrupt rather than allow/deny."""
+        if not self.agent_loop.get("active"):
+            return
+        self.interrupt_requested = True
+        # Don't clobber auto-tool mode: in "always" mode there is no pending gate
+        # wait to unblock, and overwriting it would silently disable auto-tool
+        # after the turn aborts (teardown only resets the "interrupt" sentinel).
+        # The interrupt checkpoints all fire on interrupt_requested regardless.
+        if self.allow_tool_action != "always":
+            self.allow_tool_action = "interrupt"
+        self.allow_tool_event.set()
+        logging.info("Interrupt requested by user.")
+
+    def _abort_interrupt(self, assistant_msg: str) -> None:
+        """Clean teardown shared by every interrupt checkpoint: penalize any
+        injected procedures, persist the partial answer (or a standalone marker)
+        so the turn closes with valid history, then reset loop + flags."""
+        self._penalize_injected_procedures()
+        marker = STOPPED_MARKER
+        if assistant_msg.strip():
+            self.messages.append({
+                "role": "assistant",
+                "content": assistant_msg + "\n\n" + marker,
+            })
+        else:
+            self.messages.append({"role": "assistant", "content": marker})
+        self.agent_loop = {"active": False, "state": ""}
+        self.interrupt_requested = False
+        self.tool_call_detected = False
+        if self.allow_tool_action == "interrupt":
+            self.allow_tool_action = None
+            self.allow_tool_event.clear()
+
     async def save_episode(self) -> None:
         """Summarize the current session and persist it as an episode."""
         if self.episodic_store is None:
@@ -1049,6 +1190,7 @@ class ChatSession:
                 return True
             return False
 
+        logging.info("Saving session episode — summarizing history...")
         try:
             saved = await asyncio.to_thread(_summarize_and_save)
             if saved:

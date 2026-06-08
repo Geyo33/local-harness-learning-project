@@ -361,7 +361,7 @@ class EpisodicStore:
                 with closing(self._connect()) as conn:
                     with conn:
                         conn.execute(
-                            "UPDATE procedures SET confidence = MIN(1.0, confidence + 0.05), "
+                            "UPDATE procedures SET confidence = ROUND(MIN(1.0, confidence + 0.05), 2), "
                             "action = ?, last_accessed = ? WHERE id = ?",
                             (action, ts, row_id),
                         )
@@ -481,7 +481,7 @@ class EpisodicStore:
         with closing(self._connect()) as conn:
             with conn:
                 conn.executemany(
-                    "UPDATE procedures SET confidence = MIN(1.0, MAX(0.0, confidence + ?)) WHERE id = ?",
+                    "UPDATE procedures SET confidence = ROUND(MIN(1.0, MAX(0.0, confidence + ?)), 2) WHERE id = ?",
                     [(delta, pid) for pid in ids],
                 )
                 placeholders = ",".join("?" * len(ids))

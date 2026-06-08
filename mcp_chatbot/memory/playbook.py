@@ -13,6 +13,16 @@ class PlaybookManager:
     def search(self, query: str, top_n: int = 5) -> list[dict]:
         return self._store.search_procedures(query, limit=top_n)
 
+    @staticmethod
+    def render_results(results: list[dict]) -> str:
+        """Format procedure dicts as the search_playbook tool result string.
+        Shared by execute() and the session-loop capture path so both render
+        identically off a single query."""
+        if not results:
+            return "No matching procedures found."
+        lines = [f"#{p['id']} [{p['source']}] {p['pattern']} → {p['action']}" for p in results]
+        return "\n".join(lines)
+
     def get_top_n(self, n: int) -> list[dict]:
         return self._store.get_top_procedures(n)
 
@@ -67,10 +77,7 @@ class PlaybookManager:
                 if not query:
                     return "Error: 'query' is required."
                 results = self._store.search_procedures(query, limit=5)
-                if not results:
-                    return "No matching procedures found."
-                lines = [f"#{p['id']} [{p['source']}] {p['pattern']} → {p['action']}" for p in results]
-                return "\n".join(lines)
+                return self.render_results(results)
             return f"Error: unknown playbook tool '{tool_name}'."
         except Exception as e:
             logging.error("PlaybookManager.%s error: %s", tool_name, e)

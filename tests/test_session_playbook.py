@@ -593,3 +593,127 @@ def test_attribution_empty_when_nothing_injected():
     s, _ = make_session()
     s._injected_procedures = []
     assert s._attribution_weights() == {}
+
+
+# ── self-retrieval capture: search_playbook → buffer → plan_tasks commit ───────
+
+def test_search_playbook_captures_into_buffer():
+    """A model-issued search_playbook fills _retrieved_procedures (one query,
+    same dicts used for the rendered result) so the procedures can later be
+    attributed to a plan."""
+    s, pm = make_session()
+    pm.search.return_value = [
+        {"id": 1, "pattern": "p1", "action": "a1", "source": "agent"},
+        {"id": 2, "pattern": "p2", "action": "a2", "source": "agent"},
+    ]
+    tc = {"function": {"name": "search_playbook", "arguments": '{"query":"deploy"}'}}
+    asyncio.run(s._execute_tool_call(tc))
+    pm.search.assert_called_once_with("deploy")
+    assert [p["id"] for p in s._retrieved_procedures] == [1, 2]
+
+
+def test_search_playbook_dedups_buffer_across_calls():
+    """Repeated searches in one turn merge without duplicating ids."""
+    s, pm = make_session()
+    pm.search.side_effect = [
+        [{"id": 1, "pattern": "p1", "action": "a1", "source": "agent"}],
+        [{"id": 1, "pattern": "p1", "action": "a1", "source": "agent"},
+         {"id": 3, "pattern": "p3", "action": "a3", "source": "agent"}],
+    ]
+    asyncio.run(s._execute_tool_call(
+        {"function": {"name": "search_playbook", "arguments": '{"query":"q1"}'}}))
+    asyncio.run(s._execute_tool_call(
+        {"function": {"name": "search_playbook", "arguments": '{"query":"q2"}'}}))
+    assert [p["id"] for p in s._retrieved_procedures] == [1, 3]
+
+
+def test_search_playbook_empty_query_no_capture():
+    """Empty query returns the error and leaves the buffer untouched (no query)."""
+    s, pm = make_session()
+    result = asyncio.run(s._execute_tool_call(
+        {"function": {"name": "search_playbook", "arguments": "{}"}}))
+    assert result == "Error: 'query' is required."
+    assert s._retrieved_procedures == []
+    pm.search.assert_not_called()
+
+
+def _drive_rounds(s, rounds):
+    """stream_response side_effect that emits one tool-call round per entry,
+    then plain content for a None entry (final answer)."""
+    call = [0]
+
+    def side_effect(messages, tools=None, **kw):
+        i = call[0]
+        call[0] += 1
+        entry = rounds[i] if i < len(rounds) else None
+        if entry is None:
+            return iter([{"type": "content", "data": "done"}])
+        return iter([{"type": "tool_calls_final", "data": entry}])
+
+    s.llm_client.stream_response.side_effect = side_effect
+
+
+def test_self_search_then_plan_commits_buffer_to_injected():
+    """search_playbook (buffer) followed by a model-issued plan_tasks commits the
+    buffered procedures into _injected_procedures and clears the buffer — the path
+    that was previously untracked."""
+    s, pm = make_session()
+    s.context_mgr.is_near_limit = lambda: False
+    s.planner_mode = "off"
+    s._tool_schemas = [{"type": "function", "function": {"name": "x"}}]
+    s.task_manager.is_empty.return_value = True
+    s.task_manager.tool_names = {"plan_tasks"}      # search_playbook routes to playbook
+    s.task_manager.safe_tool_names = set()          # plan_tasks needs approval
+    s.task_manager._last_all_done = False
+    s.task_manager.execute.return_value = "Plan created."
+    s.allow_tool_action = "always"
+
+    pm.search.return_value = [
+        {"id": 7, "pattern": "p", "action": "a7", "source": "agent"},
+        {"id": 9, "pattern": "q", "action": "a9", "source": "agent"},
+    ]
+
+    _drive_rounds(s, [
+        [{"id": "t1", "type": "function",
+          "function": {"name": "search_playbook", "arguments": '{"query":"deploy"}'}}],
+        [{"id": "t2", "type": "function",
+          "function": {"name": "plan_tasks", "arguments": '{"tasks":[{"title":"T"}]}'}}],
+        None,
+    ])
+
+    asyncio.run(_collect(s.handle_user_input("deploy stuff")))
+    assert [p["id"] for p in s._injected_procedures] == [7, 9]
+    assert s._retrieved_procedures == []  # cleared on commit
+
+
+def test_plan_without_search_no_reinforce_or_penalize():
+    """User's case: a model-issued plan_tasks with no prior search_playbook leaves
+    _injected_procedures empty, so completion fires neither reinforce nor penalize."""
+    s, pm = make_session()
+    s.context_mgr.is_near_limit = lambda: False
+    s.planner_mode = "off"
+    s._tool_schemas = [{"type": "function", "function": {"name": "x"}}]
+    s.task_manager.is_empty.return_value = True
+    s.task_manager.tool_names = {"plan_tasks", "update_task"}
+    s.task_manager.safe_tool_names = {"update_task"}
+    s.task_manager.execute.return_value = "ok"
+    # Static True: only the update_task round enters the completion block (gated on
+    # tool_name == "update_task"), the plan_tasks round does not.
+    s.task_manager._last_all_done = True
+    s.allow_tool_action = "always"
+    pm.tool_schemas = [{"type": "function",
+                        "function": {"name": "record_procedure", "parameters": {}}}]
+    s.llm_client.get_response.return_value = {"role": "assistant", "content": "x"}
+
+    _drive_rounds(s, [
+        [{"id": "t1", "type": "function",
+          "function": {"name": "plan_tasks", "arguments": '{"tasks":[{"title":"T"}]}'}}],
+        [{"id": "t2", "type": "function",
+          "function": {"name": "update_task", "arguments": '{"id":"1","status":"done"}'}}],
+        None,
+    ])
+
+    asyncio.run(_collect(s.handle_user_input("just do it directly")))
+    pm.reinforce.assert_not_called()
+    pm.penalize.assert_not_called()
+    assert s._injected_procedures == []

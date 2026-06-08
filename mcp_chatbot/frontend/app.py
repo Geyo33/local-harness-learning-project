@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 from mcp_chatbot.frontend.multimodal import build_content_array, IMAGE_EXTENSIONS
 from mcp_chatbot.settings import load_settings, save_settings
+from mcp_chatbot.frontend.disconnect import can_save_episode
 
 
 class GradioChat:
@@ -83,13 +84,32 @@ async def update_servers(selected_servers: list):
     logging.info("\n--- Servers updated ---")
 
 
-async def shutdown_client():
-    """Called when Gradio is closing to ensure clean exit."""
+async def _cleanup_session():
+    """Tear down servers and drop the session (no episode save)."""
     if chat_session.session:
         logging.info("\n--- Initiating Graceful Shutdown ---")
-        await chat_session.session.save_episode()
         await chat_session.session.cleanup_servers()
         chat_session.session = None
+
+
+async def shutdown_client():
+    """Called when Gradio is closing (browser unload) — saves then cleans up."""
+    if chat_session.session:
+        await chat_session.session.save_episode()
+    await _cleanup_session()
+
+
+async def do_disconnect_save():
+    """Disconnect button path: persist the episode, then clean up."""
+    if chat_session.session:
+        await chat_session.session.save_episode()
+    await _cleanup_session()
+
+
+async def do_disconnect_nosave():
+    """Disconnect button path: clean up without saving an episode."""
+    await _cleanup_session()
+
 
 async def save_planner_mode(value: str):
     current = load_settings()
@@ -98,6 +118,26 @@ async def save_planner_mode(value: str):
     if chat_session.session:
         chat_session.session.planner_mode = value
     return f"Planner mode set to: {value}"
+
+
+async def request_interrupt():
+    """Wired to msg_input.stop — cooperatively aborts the current agent turn."""
+    if chat_session.session:
+        await chat_session.session.request_interrupt()
+
+
+def open_disconnect_modal():
+    """Decide modal contents based on whether the session is worth saving."""
+    s = chat_session.session
+    count = len(s.messages[1:]) if s else 0
+    can_save = can_save_episode(bool(s and s.episodic_store), count)
+    msg = ("Save this session to memory before disconnecting?"
+           if can_save else "Disconnect now?")
+    return (
+        gr.update(visible=True),         # disconnect_modal
+        gr.update(value=f"### {msg}"),   # modal_msg
+        gr.update(visible=can_save),     # save_disconnect_btn
+    )
 
 
 def render_episodes(episodes: list[dict]) -> str:
@@ -400,12 +440,24 @@ async def handle_chat(input: dict[str, str | list], history: list, tool_validati
 css = """
 
 #col { height: calc(100vh - 112px - 16px); }
-#col2 { height: calc(100vh - 112px - 67px); }
+#col2 { height: calc(100vh - 112px - 16px); overflow-y: auto; }
 h1 {
     text-align: center;
 }
 #centertext {
     text-align: center;
+}
+#disconnect-modal {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,0.6);
+}
+#disconnect-modal.hide { display: none !important; }
+.disconnect-card {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: auto; min-width: 320px; max-width: 420px;
+    background: #1a1f2e; padding: 24px; border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
 }
 """
 
@@ -457,6 +509,7 @@ def build_app():
                     with gr.Column(scale=1, variant="panel", min_width=100, elem_id="col2"):
                         with gr.Row(scale=1):
                             with gr.Column(variant="compact"):
+                                disconnect_btn = gr.Button("Disconnect", variant="stop", size="sm")
                                 with gr.Accordion(label="Tasks", open=True):
                                     task_list_display = gr.HTML(value="", label="Tasks", container=True, min_height=200, show_label=False)
                                 auto_tool = gr.Checkbox(label="Auto-tool", container=True) 
@@ -466,14 +519,19 @@ def build_app():
                                     mcp_list = gr.CheckboxGroup(["          ","          ","          "], label="activate all", show_select_all=True, container=True)
                                     with gr.Row():
                                         save_servers = gr.Button("Save", variant="primary", size="sm", min_width=20)
-                                        btn_stop = gr.Button("Stop", variant="stop", size="sm", min_width=20)
 
                 with gr.Row(max_height=40):
                     usage_bar = gr.HTML()
                 with gr.Row():
                     gr.Markdown("---")
 
-                            
+                with gr.Column(visible=False, elem_id="disconnect-modal") as disconnect_modal:
+                    with gr.Column(elem_classes="disconnect-card"):
+                        modal_msg = gr.Markdown("### Disconnect now?")
+                        with gr.Row():
+                            save_disconnect_btn = gr.Button("Save & Disconnect", variant="primary", size="sm")
+                            plain_disconnect_btn = gr.Button("Disconnect", variant="stop", size="sm")
+                            cancel_btn = gr.Button("Cancel", variant="secondary", size="sm")
 
             with gr.Tab("Settings"):
                 gr.Markdown("### File Access")
@@ -519,6 +577,8 @@ def build_app():
             outputs=[msg_input, chatbot, tool_validation_box, tool_allow_btn, tool_deny_btn, task_list_display, usage_bar],
         ).success(update_usage, outputs=usage_bar).success(update_task_panel, outputs=task_list_display)
 
+        msg_input.stop(request_interrupt)
+
         refresh_servers.click(servers_state, outputs=mcp_list)
         save_servers.click(update_servers, inputs=mcp_list)
 
@@ -547,7 +607,18 @@ def build_app():
             gr.close_all()
         def pre_close_app():
             return gr.update(value="# --- Client Disconnected ---", visible=True), gr.update(interactive=False, placeholder="Session Terminated")
-        btn_stop.click(pre_close_app, outputs=[tool_validation_box, msg_input]).then(shutdown_client).then(close_app)
+
+        disconnect_btn.click(
+            open_disconnect_modal,
+            outputs=[disconnect_modal, modal_msg, save_disconnect_btn],
+        )
+        cancel_btn.click(lambda: gr.update(visible=False), outputs=disconnect_modal)
+        save_disconnect_btn.click(
+            pre_close_app, outputs=[tool_validation_box, msg_input]
+        ).then(lambda: gr.update(visible=False), outputs=disconnect_modal).then(do_disconnect_save).then(close_app)
+        plain_disconnect_btn.click(
+            pre_close_app, outputs=[tool_validation_box, msg_input]
+        ).then(lambda: gr.update(visible=False), outputs=disconnect_modal).then(do_disconnect_nosave).then(close_app)
 
         demo.unload(close_app)
 

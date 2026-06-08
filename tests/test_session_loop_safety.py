@@ -351,3 +351,262 @@ def test_stale_nudge_not_injected_when_no_in_progress():
         for msgs in captured_msgs_list
     )
     assert not nudge_present
+
+
+# ── interrupt: primitives ─────────────────────────────────────────────────────
+
+def test_request_interrupt_sets_flag_and_unblocks_gate():
+    """request_interrupt sets the flag, a sentinel action, and the gate event."""
+    session = make_session()
+    session.agent_loop = {"active": True, "state": ""}
+    assert session.interrupt_requested is False
+
+    asyncio.run(session.request_interrupt())
+
+    assert session.interrupt_requested is True
+    assert session.allow_tool_action == "interrupt"
+    assert session.allow_tool_event.is_set()
+
+
+def test_request_interrupt_noop_when_loop_inactive():
+    """No active turn → request_interrupt does nothing (avoids leaking into the
+    next turn's approval gate)."""
+    session = make_session()
+    session.agent_loop = {"active": False, "state": ""}
+
+    asyncio.run(session.request_interrupt())
+
+    assert session.interrupt_requested is False
+    assert session.allow_tool_action is None
+    assert not session.allow_tool_event.is_set()
+
+
+def test_abort_interrupt_keeps_partial_and_marks():
+    """_abort_interrupt persists partial text + marker, resets loop, clears flag."""
+    session = make_session()
+    session.interrupt_requested = True
+    session.agent_loop = {"active": True, "state": "streaming"}
+
+    session._abort_interrupt("partial answer")
+
+    assert session.messages[-1]["role"] == "assistant"
+    assert "partial answer" in session.messages[-1]["content"]
+    assert "_[Stopped by user]_" in session.messages[-1]["content"]
+    assert session.agent_loop == {"active": False, "state": ""}
+    assert session.interrupt_requested is False
+    assert session.tool_call_detected is False
+
+
+def test_abort_interrupt_empty_partial_appends_standalone_marker():
+    """With no partial text, a standalone marker message still closes the turn."""
+    session = make_session()
+    session.interrupt_requested = True
+
+    session._abort_interrupt("")
+
+    assert session.messages[-1] == {
+        "role": "assistant", "content": "_[Stopped by user]_",
+    }
+
+
+# ── interrupt: loop checkpoints ───────────────────────────────────────────────
+
+def test_interrupt_between_tool_calls_aborts_and_keeps_history():
+    """Flag set while a tool executes → loop aborts at the next checkpoint;
+    history keeps the tool result and ends with a stopped marker."""
+    session = make_session()
+    session.task_manager.tool_names = {"update_task"}
+    session.task_manager.safe_tool_names = {"update_task"}
+
+    def execute(name, args):
+        session.interrupt_requested = True  # simulate stop pressed during the tool
+        return "tool ran"
+    session.task_manager.execute.side_effect = execute
+
+    session.llm_client.stream_response.side_effect = (
+        lambda *a, **kw: _tool_call_response("update_task", {"id": "1", "status": "in_progress"})
+    )
+
+    results = asyncio.run(_collect(session.handle_user_input("go")))
+
+    assert any("_[Stopped by user]_" in str(r) for r in results)
+    assert session.agent_loop["active"] is False
+    # exactly one LLM round happened before the abort
+    assert session.llm_client.stream_response.call_count == 1
+    # history is valid: the safe tool produced a paired role:tool message,
+    # and the turn closes with the stopped marker
+    assert session.messages[-1]["content"] == "_[Stopped by user]_"
+    assert any(m["role"] == "tool" for m in session.messages)
+
+
+def test_entry_resets_stale_interrupt_flag():
+    """A flag left set before a turn starts must not abort the new turn."""
+    session = make_session()
+    session.interrupt_requested = True  # stale
+    session.llm_client.stream_response.side_effect = (
+        lambda *a, **kw: _good_text_response("Hello.")
+    )
+
+    results = asyncio.run(_collect(session.handle_user_input("go")))
+
+    assert any("Hello." in str(r) for r in results)
+    assert not any("_[Stopped by user]_" in str(r) for r in results)
+
+
+def test_interrupt_multi_tool_round_pairs_all_calls():
+    """If a round returns multiple tool calls and interrupt fires before they all
+    run, every tool_call id must still get a paired role:tool result (valid
+    history for strict templates)."""
+    import json as _json
+    session = make_session()
+    session.task_manager.tool_names = {"update_task"}
+    session.task_manager.safe_tool_names = {"update_task"}
+
+    def execute(name, args):
+        # stop pressed during the FIRST tool of the round
+        session.interrupt_requested = True
+        return "ran"
+    session.task_manager.execute.side_effect = execute
+
+    def two_calls(*a, **kw):
+        yield {
+            "type": "tool_calls_final",
+            "data": [
+                {"id": "tcA", "type": "function",
+                 "function": {"name": "update_task", "arguments": _json.dumps({"id": "1", "status": "in_progress"})}},
+                {"id": "tcB", "type": "function",
+                 "function": {"name": "update_task", "arguments": _json.dumps({"id": "2", "status": "in_progress"})}},
+            ],
+        }
+    session.llm_client.stream_response.side_effect = two_calls
+
+    asyncio.run(_collect(session.handle_user_input("go")))
+
+    # collect tool_call ids from assistant messages and tool_call_ids from tool messages
+    called_ids = set()
+    for m in session.messages:
+        for tc in (m.get("tool_calls") or []):
+            called_ids.add(tc["id"])
+    paired_ids = {m["tool_call_id"] for m in session.messages if m["role"] == "tool"}
+
+    assert called_ids, "no tool_calls recorded"
+    # every tool_call id must have a paired role:tool result
+    assert called_ids <= paired_ids, f"orphaned tool_calls: {called_ids - paired_ids}"
+    assert session.messages[-1]["content"] == "_[Stopped by user]_"
+
+
+def test_interrupt_mid_stream_keeps_partial_text():
+    """Flag set after the first token → streaming stops, partial text is kept and
+    marked, no further tokens are emitted."""
+    session = make_session()
+
+    def streaming_gen(*a, **kw):
+        yield {"type": "content", "data": "first part "}
+        session.interrupt_requested = True  # stop pressed mid-stream
+        yield {"type": "content", "data": "SHOULD_NOT_APPEAR"}
+    session.llm_client.stream_response.side_effect = streaming_gen
+
+    results = asyncio.run(_collect(session.handle_user_input("go")))
+
+    joined = "".join(str(r) for r in results)
+    assert "first part " in joined
+    assert "SHOULD_NOT_APPEAR" not in joined
+    assert "_[Stopped by user]_" in joined
+    assert session.agent_loop["active"] is False
+    assert "first part " in session.messages[-1]["content"]
+    assert "_[Stopped by user]_" in session.messages[-1]["content"]
+
+
+def test_interrupt_at_gate_denies_then_aborts():
+    """Stop pressed while an unsafe tool waits at the approval gate → reuse the
+    deny path (paired role:tool result) then abort the whole loop."""
+    session = make_session()
+    # an unsafe tool (not in any safe set) → triggers the approval gate
+    session._tool_schemas = [{"type": "function", "function": {"name": "danger_tool"}}]
+    session._tool_server_map = {"danger_tool": MagicMock()}
+
+    session.llm_client.stream_response.side_effect = (
+        lambda *a, **kw: _tool_call_response("danger_tool", {"x": 1})
+    )
+
+    async def driver():
+        gen = session.handle_user_input("go")
+        out = []
+        async for item in gen:
+            out.append(item)
+            # the tuple yield is the pending tool-approval request
+            if isinstance(item, tuple):
+                await session.request_interrupt()
+        return out
+
+    results = asyncio.run(driver())
+
+    assert any("Tool call denied" in str(r) for r in results)
+    assert any("_[Stopped by user]_" in str(r) for r in results)
+    assert session.agent_loop["active"] is False
+    # history validity: the assistant tool_calls entry has a paired role:tool msg
+    assert any(m.get("tool_calls") for m in session.messages)
+    assert any(m["role"] == "tool" for m in session.messages)
+    # loop did not continue after the gate (only the one LLM round)
+    assert session.llm_client.stream_response.call_count == 1
+
+
+def test_request_interrupt_does_not_clobber_always():
+    """request_interrupt must not overwrite auto-tool mode: in 'always' mode there
+    is no pending gate wait, and overwriting would silently disable auto-tool."""
+    session = make_session()
+    session.agent_loop = {"active": True, "state": ""}
+    session.allow_tool_action = "always"
+
+    asyncio.run(session.request_interrupt())
+
+    assert session.interrupt_requested is True
+    assert session.allow_tool_action == "always"  # not clobbered to "interrupt"
+    assert session.allow_tool_event.is_set()
+
+
+def test_interrupt_preserves_auto_tool_mode():
+    """Interrupting while auto-tool ('always') is on must not silently disable it:
+    allow_tool_action stays 'always' through the abort so the next turn still
+    bypasses the approval gate."""
+    session = make_session()
+    session.allow_tool_action = "always"
+
+    def streaming_gen(*a, **kw):
+        yield {"type": "content", "data": "partial "}
+        session.interrupt_requested = True
+        yield {"type": "content", "data": "more"}
+    session.llm_client.stream_response.side_effect = streaming_gen
+
+    asyncio.run(_collect(session.handle_user_input("go")))
+
+    assert session.allow_tool_action == "always"
+    assert session.interrupt_requested is False
+
+
+def test_interrupt_at_gate_clears_tool_call_detected_before_oio_yield():
+    """Regression: the gate-interrupt path must clear tool_call_detected before
+    yielding its o|o string. handle_chat checks the tool_call_detected branch
+    first and would otherwise unpack the string as a (name, args) tuple and raise
+    ValueError. The generator pauses right after each yield, so reading the flag
+    in the driver reflects its value at yield time."""
+    session = make_session()
+    session._tool_schemas = [{"type": "function", "function": {"name": "danger_tool"}}]
+    session._tool_server_map = {"danger_tool": MagicMock()}
+    session.llm_client.stream_response.side_effect = (
+        lambda *a, **kw: _tool_call_response("danger_tool", {"x": 1})
+    )
+
+    async def driver():
+        gen = session.handle_user_input("go")
+        async for item in gen:
+            if isinstance(item, tuple):
+                await session.request_interrupt()
+            elif isinstance(item, str) and "o|o" in item:
+                # mirror handle_chat: a structured o|o event must NOT be flagged
+                # as a pending tool call
+                assert session.tool_call_detected is False, (
+                    "tool_call_detected still True when o|o event was yielded"
+                )
+
+    asyncio.run(driver())
