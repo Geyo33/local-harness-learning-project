@@ -7,11 +7,18 @@ from pathlib import Path
 _SETTINGS_PATH = Path("mcp_chatbot") / "settings.json"
 
 DEFAULTS: dict = {
-    "file_root": str(Path(__file__).parent.parent.resolve()),  
+    "file_root": str(Path(__file__).parent.parent.resolve()),
     "planner_mode": "auto",
     "memory_episodes": 3,
     "memory_key_facts": 20,
     "playbook_top_n": 10,
+    "agent_timeout": 900,
+    "max_output_tokens": 4096,
+    "memory_retrieval_k": 5,
+    "memory_retrieval_ttl": 3,
+    "facts_nudge_turns": 8,
+    "facts_nudge_progress": 0,
+    "tool_blacklist": {"tools": [], "skills": []},
 }
 
 

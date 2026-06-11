@@ -119,13 +119,22 @@ def semantic_search(conn: sqlite3.Connection, query_vec: list[float], limit: int
 def keyword_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dict]:
     results = []
 
+    # OR-join quoted tokens so a conversational query matches rows sharing only
+    # some keywords; FTS5's default implicit-AND would require every filler word
+    # to appear and match nothing (mirrors EpisodicStore.search_memory). The LIKE
+    # fallbacks still use the raw substring. Empty token set raises into fallback.
+    tokens = re.findall(r"\w+", query.lower())
+    fts_query = " OR ".join(f'"{t}"' for t in tokens)
+
     # FTS5 on episodes
     try:
+        if not fts_query:
+            raise sqlite3.OperationalError("empty query")
         cursor = conn.execute(
             "SELECT e.id, e.summary, e.created_at, e.source, f.rank "
             "FROM episodes_fts f JOIN episodes e ON e.id = f.rowid "
             "WHERE episodes_fts MATCH ? ORDER BY f.rank LIMIT ?",
-            (query, limit),
+            (fts_query, limit),
         )
         rows = cursor.fetchall()
         if rows:
@@ -153,11 +162,13 @@ def keyword_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dic
 
     # FTS5 on key_facts
     try:
+        if not fts_query:
+            raise sqlite3.OperationalError("empty query")
         cursor = conn.execute(
             "SELECT kf.id, kf.fact, kf.created_at, kf.source, f.rank "
             "FROM key_facts_fts f JOIN key_facts kf ON kf.id = f.rowid "
-            "WHERE key_facts_fts MATCH ? ORDER BY f.rank LIMIT ?",
-            (query, limit),
+            "WHERE key_facts_fts MATCH ? AND kf.status = 'approved' ORDER BY f.rank LIMIT ?",
+            (fts_query, limit),
         )
         rows = cursor.fetchall()
         if rows:
@@ -174,7 +185,7 @@ def keyword_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dic
         logging.warning("key_facts_fts unavailable, falling back to LIKE search: %s", e)
         cursor = conn.execute(
             "SELECT id, fact, created_at, source FROM key_facts "
-            "WHERE fact LIKE ? ORDER BY last_accessed DESC LIMIT ?",
+            "WHERE fact LIKE ? AND status = 'approved' ORDER BY last_accessed DESC LIMIT ?",
             (f"%{query}%", limit),
         )
         for r in cursor.fetchall():
@@ -185,11 +196,13 @@ def keyword_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dic
 
     # FTS5 on procedures
     try:
+        if not fts_query:
+            raise sqlite3.OperationalError("empty query")
         cursor = conn.execute(
             "SELECT p.id, p.pattern, p.action, p.created_at, p.source, f.rank "
             "FROM procedures_fts f JOIN procedures p ON p.id = f.rowid "
             "WHERE procedures_fts MATCH ? ORDER BY f.rank LIMIT ?",
-            (query, limit),
+            (fts_query, limit),
         )
         rows = cursor.fetchall()
         if rows:

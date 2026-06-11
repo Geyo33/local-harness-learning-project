@@ -122,6 +122,7 @@ class LLMClient:
         url, headers, payload = self._build_payload(messages, tools, stream=True, tool_choice=tool_choice, response_format=response_format)
 
         tool_calls = {}
+        finish_reason = None
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -147,6 +148,8 @@ class LLMClient:
                             continue
 
                         choice = data["choices"][0]
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
                         delta = choice.get("delta", {})
 
                         content = delta.get("content")
@@ -181,6 +184,9 @@ class LLMClient:
                             "type": "tool_calls_final",
                             "data": [tool_calls[i] for i in sorted(tool_calls)],
                         }
+
+                    if finish_reason == "length":
+                        yield {"type": "truncated", "data": finish_reason}
 
         except httpx.HTTPStatusError as e:
             body = _read_error_body(e)

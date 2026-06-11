@@ -67,7 +67,10 @@ class EpisodicStore:
                         fact          TEXT NOT NULL,
                         created_at    REAL NOT NULL,
                         last_accessed REAL NOT NULL,
-                        source        TEXT NOT NULL
+                        source        TEXT NOT NULL,
+                        pinned        INTEGER NOT NULL DEFAULT 0,
+                        tags          TEXT,
+                        status        TEXT NOT NULL DEFAULT 'approved'
                     )
                 """)
                 conn.execute("""
@@ -177,6 +180,7 @@ class EpisodicStore:
                     SELECT p.id, p.pattern, p.action FROM procedures p
                     WHERE p.id NOT IN (SELECT rowid FROM procedures_fts)
                 """)
+        self._ensure_key_facts_columns()
 
     def add_episode(
         self,
@@ -208,15 +212,15 @@ class EpisodicStore:
             for r in rows
         ]
 
-    def remember_fact(self, fact: str, source: str = "agent") -> int:
-        """Insert a key fact. Returns the new row id."""
+    def remember_fact(self, fact: str, source: str = "agent", status: str = "approved") -> int:
+        """Insert a key fact. Returns the new row id. status: 'approved' | 'pending'."""
         ts = time.time()
         with closing(self._connect()) as conn:
             with conn:
                 cursor = conn.execute(
-                    "INSERT INTO key_facts (fact, created_at, last_accessed, source) "
-                    "VALUES (?, ?, ?, ?)",
-                    (fact, ts, ts, source),
+                    "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (fact, ts, ts, source, status),
                 )
                 return cursor.lastrowid
 
@@ -249,11 +253,53 @@ class EpisodicStore:
                 )
                 return cursor.rowcount > 0
 
+    def get_pending_facts(self) -> list[dict]:
+        """Return all facts awaiting review, newest first."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "SELECT id, fact, created_at, source, tags FROM key_facts "
+                "WHERE status = 'pending' ORDER BY created_at DESC, id DESC"
+            )
+            rows = cursor.fetchall()
+        return [
+            {"id": r[0], "fact": r[1], "created_at": r[2], "source": r[3], "tags": r[4]}
+            for r in rows
+        ]
+
+    def approve_fact(self, fact_id: int, new_fact: str | None = None, pinned: bool = False) -> bool:
+        """Promote a pending fact to approved, optionally editing its text and pinning it.
+        Returns True if a row was updated."""
+        ts = time.time()
+        pin_val = 1 if pinned else 0
+        with closing(self._connect()) as conn:
+            with conn:
+                if new_fact is not None and new_fact.strip():
+                    cursor = conn.execute(
+                        "UPDATE key_facts SET fact = ?, status = 'approved', pinned = ?, "
+                        "last_accessed = ? WHERE id = ?",
+                        (new_fact.strip(), pin_val, ts, fact_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "UPDATE key_facts SET status = 'approved', pinned = ?, "
+                        "last_accessed = ? WHERE id = ?",
+                        (pin_val, ts, fact_id),
+                    )
+                return cursor.rowcount > 0
+
+    def count_pending(self) -> int:
+        """Return the number of facts with status='pending'."""
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM key_facts WHERE status = 'pending'"
+            ).fetchone()[0]
+
     def get_key_facts(self, limit: int = 20) -> list[dict]:
-        """Return key facts ranked by source-weighted time decay score."""
+        """Return approved key facts ranked by source-weighted time decay score."""
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 "SELECT id, fact, created_at, source, last_accessed FROM key_facts "
+                "WHERE status = 'approved' "
                 "LIMIT ?",
                 (_MAX_KEY_FACTS_FETCH,),
             )
@@ -269,11 +315,40 @@ class EpisodicStore:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:limit]]
 
+    def get_pinned_facts(self, limit: int = 20) -> list[dict]:
+        """Return approved + pinned facts ranked by source-weighted time decay."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "SELECT id, fact, created_at, source, last_accessed FROM key_facts "
+                "WHERE status = 'approved' AND pinned = 1 "
+                "LIMIT ?",
+                (_MAX_KEY_FACTS_FETCH,),
+            )
+            rows = cursor.fetchall()
+        now = time.time()
+        scored = []
+        for r in rows:
+            days = (now - r[4]) / 86400.0
+            score = _SOURCE_WEIGHT.get(r[3], 0.8) * math.exp(-_DECAY_LAMBDA * days)
+            scored.append((score, {"id": r[0], "fact": r[1], "created_at": r[2], "source": r[3]}))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[:limit]]
+
     def search_memory(self, query: str, limit: int = 10) -> list[dict]:
-        """FTS5 BM25 search on episodes + key_facts."""
+        """FTS5 BM25 search on episodes + key_facts.
+
+        Query tokens are OR-joined (each quoted as a literal) so a conversational
+        request matches rows sharing only some keywords; FTS5's default implicit-
+        AND would otherwise require every filler word to appear and match nothing
+        (mirrors search_facts / search_procedures). The LIKE fallbacks still use
+        the raw substring."""
+        tokens = re.findall(r"\w+", query.lower())
+        fts_query = " OR ".join(f'"{t}"' for t in tokens)
         results: list[dict] = []
         with closing(self._connect()) as conn:
             try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty query")
                 cursor = conn.execute(
                     """
                     SELECT 'episode' AS type, e.id, e.summary, e.created_at, e.source, f.rank
@@ -283,7 +358,7 @@ class EpisodicStore:
                     ORDER BY f.rank
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (fts_query, limit),
                 )
                 for row in cursor.fetchall():
                     results.append({
@@ -303,16 +378,18 @@ class EpisodicStore:
                     })
 
             try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty query")
                 cursor = conn.execute(
                     """
                     SELECT 'fact' AS type, kf.id, kf.fact, kf.created_at, kf.source, f.rank
                     FROM key_facts_fts f
                     JOIN key_facts kf ON kf.id = f.rowid
-                    WHERE key_facts_fts MATCH ?
+                    WHERE key_facts_fts MATCH ? AND kf.status = 'approved'
                     ORDER BY f.rank
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (fts_query, limit),
                 )
                 for row in cursor.fetchall():
                     results.append({
@@ -322,7 +399,7 @@ class EpisodicStore:
             except sqlite3.OperationalError:
                 cursor = conn.execute(
                     "SELECT id, fact, created_at, source FROM key_facts "
-                    "WHERE fact LIKE ? ORDER BY last_accessed DESC LIMIT ?",
+                    "WHERE fact LIKE ? AND status = 'approved' ORDER BY last_accessed DESC LIMIT ?",
                     (f"%{query}%", limit),
                 )
                 for row in cursor.fetchall():
@@ -335,6 +412,69 @@ class EpisodicStore:
             results = results[:limit]
 
             fact_ids = [r["id"] for r in results if r["type"] == "fact"]
+            if fact_ids:
+                try:
+                    now = time.time()
+                    with conn:
+                        conn.executemany(
+                            "UPDATE key_facts SET last_accessed = ? WHERE id = ?",
+                            [(now, fid) for fid in fact_ids],
+                        )
+                except sqlite3.DatabaseError:
+                    logging.warning(
+                        "Failed to refresh last_accessed for fact ids %s", fact_ids
+                    )
+
+        return results
+
+    def search_facts(self, query: str, limit: int = 5) -> list[dict]:
+        """Facts-only FTS5 BM25 search (approved facts). Separate from
+        search_memory so the ephemeral fact window isn't crowded out: episodes
+        and facts share search_memory's single merged `limit` cut (and their
+        BM25 ranks aren't cross-comparable), so episode hits can evict every
+        fact before the type filter runs. This path queries only key_facts.
+
+        Query tokens are OR-joined (each quoted as a literal): a fact matches if
+        it contains *any* token, with BM25 still ranking denser matches higher.
+        Without this, FTS5's default implicit-AND requires every token — including
+        filler words from a conversational query — to appear, so a natural-
+        language question matches nothing (mirrors search_procedures)."""
+        tokens = re.findall(r"\w+", query.lower())
+        fts_query = " OR ".join(f'"{t}"' for t in tokens)
+        results: list[dict] = []
+        with closing(self._connect()) as conn:
+            try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty query")
+                cursor = conn.execute(
+                    """
+                    SELECT 'fact' AS type, kf.id, kf.fact, kf.created_at, kf.source, f.rank
+                    FROM key_facts_fts f
+                    JOIN key_facts kf ON kf.id = f.rowid
+                    WHERE key_facts_fts MATCH ? AND kf.status = 'approved'
+                    ORDER BY f.rank
+                    LIMIT ?
+                    """,
+                    (fts_query, limit),
+                )
+                for row in cursor.fetchall():
+                    results.append({
+                        "type": row[0], "id": row[1], "text": row[2],
+                        "created_at": row[3], "source": row[4], "score": row[5],
+                    })
+            except sqlite3.OperationalError:
+                cursor = conn.execute(
+                    "SELECT id, fact, created_at, source FROM key_facts "
+                    "WHERE fact LIKE ? AND status = 'approved' ORDER BY last_accessed DESC LIMIT ?",
+                    (f"%{query}%", limit),
+                )
+                for row in cursor.fetchall():
+                    results.append({
+                        "type": "fact", "id": row[0], "text": row[1],
+                        "created_at": row[2], "source": row[3], "score": 0,
+                    })
+
+            fact_ids = [r["id"] for r in results]
             if fact_ids:
                 try:
                     now = time.time()
@@ -489,6 +629,26 @@ class EpisodicStore:
                     f"DELETE FROM procedures WHERE id IN ({placeholders}) AND confidence <= ?",
                     [*ids, floor],
                 )
+
+    def _ensure_key_facts_columns(self) -> None:
+        """Idempotently add pinned/tags/status columns to an existing key_facts table.
+
+        Upgrade path for pre-existing databases; on a fresh DB the guards no-op.
+        status domain: 'pending' (awaiting review) | 'approved' (default, visible to LLM).
+        """
+        with closing(self._connect()) as conn:
+            with conn:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(key_facts)")}
+                if "pinned" not in cols:
+                    conn.execute(
+                        "ALTER TABLE key_facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "tags" not in cols:
+                    conn.execute("ALTER TABLE key_facts ADD COLUMN tags TEXT")
+                if "status" not in cols:
+                    conn.execute(
+                        "ALTER TABLE key_facts ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"
+                    )
 
     def _migrate_playbook_json(self) -> None:
         """One-time import of legacy playbook.json into the procedures table."""

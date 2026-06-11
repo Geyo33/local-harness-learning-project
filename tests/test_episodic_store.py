@@ -227,6 +227,20 @@ def test_search_memory_finds_fact_via_like(tmp_path):
     assert any("dark mode" in r["text"] for r in results)
 
 
+def test_search_memory_matches_conversational_query(tmp_path):
+    # Tokens are OR-joined: a full natural-language question matches rows sharing
+    # only some keywords. Raw FTS5 implicit-AND would require every filler word
+    # ("what", "about", "being") present and match nothing.
+    store = _store(tmp_path)
+    store.remember_fact(
+        "Entities are initialized with None as their tilemap; BaseScene must assign one."
+    )
+    store.add_episode("sess", "Refactored tilemap assignment in base scene.", "agent")
+    results = store.search_memory("And what about tilemap being None base scene and entities ?")
+    assert any(r["type"] == "fact" for r in results)
+    assert any(r["type"] == "episode" for r in results)
+
+
 def test_search_memory_no_match_returns_empty(tmp_path):
     store = _store(tmp_path)
     store.add_episode("sess", "Something unrelated.", "agent")
@@ -265,6 +279,65 @@ def test_search_memory_respects_limit(tmp_path):
         store.remember_fact(f"Python fact number {i}")
     results = store.search_memory("Python", limit=4)
     assert len(results) <= 4, "results must not exceed limit"
+
+
+# ── search_facts ──────────────────────────────────────────────────────────────
+
+def test_search_facts_finds_fact(tmp_path):
+    store = _store(tmp_path)
+    store.remember_fact("User prefers dark mode.")
+    results = store.search_facts("dark mode")
+    assert results
+    assert all(r["type"] == "fact" for r in results)
+    assert any("dark mode" in r["text"] for r in results)
+
+
+def test_search_facts_excludes_episodes(tmp_path):
+    store = _store(tmp_path)
+    store.add_episode("sess", "Python tutorial episode about dark mode themes", "agent")
+    store.remember_fact("User prefers dark mode.")
+    results = store.search_facts("dark mode")
+    assert results
+    assert all(r["type"] == "fact" for r in results)
+
+
+def test_search_facts_not_crowded_out_by_episodes(tmp_path):
+    # Regression: search_memory merges episodes+facts under one shared limit, so
+    # many matching episodes can evict every fact before the caller filters to
+    # facts. search_facts queries only key_facts, so the fact survives.
+    store = _store(tmp_path)
+    for i in range(10):
+        store.add_episode("s", f"Python episode number {i} about retrieval", "agent")
+    store.remember_fact("Python retrieval fact worth keeping")
+    results = store.search_facts("Python retrieval", limit=5)
+    assert any(r["type"] == "fact" for r in results)
+
+
+def test_search_facts_matches_conversational_query(tmp_path):
+    # Tokens are OR-joined: a full natural-language question must still match a
+    # fact sharing only some keywords. Raw FTS5 implicit-AND would require every
+    # filler word ("what", "about", "being") to appear and match nothing.
+    store = _store(tmp_path)
+    store.remember_fact(
+        "Entities are initialized with None as their tilemap; BaseScene must assign one."
+    )
+    results = store.search_facts("And what about tilemap being None base scene and entities ?")
+    assert any(r["type"] == "fact" for r in results)
+
+
+def test_search_facts_excludes_pending(tmp_path):
+    store = _store(tmp_path)
+    store.remember_fact("Pending unreviewed fact about widgets", status="pending")
+    results = store.search_facts("widgets")
+    assert results == []
+
+
+def test_search_facts_respects_limit(tmp_path):
+    store = _store(tmp_path)
+    for i in range(5):
+        store.remember_fact(f"Python fact number {i}")
+    results = store.search_facts("Python", limit=3)
+    assert len(results) <= 3
 
 
 # ── _fact_similar ─────────────────────────────────────────────────────────────
@@ -330,3 +403,100 @@ def test_fact_similar_numeric_difference_blocked():
     # "API timeout is 60s" is a correction of "API timeout is 30s" — use update_fact.
     from mcp_chatbot.memory.store import _fact_similar
     assert _fact_similar("API timeout is 30 seconds.", "API timeout is 60 seconds.") is True
+
+
+# ── key_facts column migration ────────────────────────────────────────────────
+
+def test_key_facts_has_pinned_tags_status_columns(tmp_path):
+    from mcp_chatbot.memory.store import EpisodicStore
+    store = EpisodicStore(tmp_path / "memory.db")
+    import sqlite3
+    with sqlite3.connect(store._path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(key_facts)")}
+    assert {"pinned", "tags", "status"} <= cols
+
+
+def test_existing_facts_default_to_approved(tmp_path):
+    from mcp_chatbot.memory.store import EpisodicStore
+    store = EpisodicStore(tmp_path / "memory.db")
+    fid = store.remember_fact("a default fact")
+    import sqlite3
+    with sqlite3.connect(store._path) as conn:
+        row = conn.execute(
+            "SELECT status, pinned FROM key_facts WHERE id=?", (fid,)
+        ).fetchone()
+    assert row[0] == "approved"
+    assert row[1] == 0
+
+
+def test_ensure_columns_upgrades_old_schema(tmp_path):
+    import sqlite3
+    from mcp_chatbot.memory.store import EpisodicStore
+    db = tmp_path / "memory.db"
+    # Create an OLD-schema key_facts table lacking the new columns.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE key_facts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT NOT NULL, "
+            "created_at REAL, last_accessed REAL, source TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO key_facts (fact, created_at, last_accessed, source) "
+            "VALUES ('legacy fact', 0, 0, 'user')"
+        )
+    # Constructing the store must add the columns idempotently and not error.
+    store = EpisodicStore(db)
+    with sqlite3.connect(store._path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(key_facts)")}
+        row = conn.execute(
+            "SELECT status, pinned FROM key_facts WHERE fact='legacy fact'"
+        ).fetchone()
+    assert {"pinned", "tags", "status"} <= cols
+    assert row[0] == "approved"  # NOT NULL DEFAULT applies to the new column
+    assert row[1] == 0
+
+
+# ── status / pinned filters ───────────────────────────────────────────────────
+
+def test_get_key_facts_excludes_pending(tmp_path):
+    import sqlite3
+    from mcp_chatbot.memory.store import EpisodicStore
+    store = EpisodicStore(tmp_path / "memory.db")
+    store.remember_fact("approved fact")  # defaults to approved
+    with sqlite3.connect(store._path) as conn:
+        conn.execute(
+            "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) "
+            "VALUES ('pending fact', 0, 0, 'agent', 'pending')"
+        )
+    facts = store.get_key_facts()
+    texts = [f["fact"] for f in facts]
+    assert "approved fact" in texts
+    assert "pending fact" not in texts
+
+
+def test_get_pinned_facts_only_pinned_approved(tmp_path):
+    import sqlite3
+    from mcp_chatbot.memory.store import EpisodicStore
+    store = EpisodicStore(tmp_path / "memory.db")
+    pid = store.remember_fact("pin me")       # approved, unpinned
+    store.remember_fact("unpinned")           # approved, unpinned
+    with sqlite3.connect(store._path) as conn:
+        conn.execute("UPDATE key_facts SET pinned = 1 WHERE id = ?", (pid,))
+    pinned = store.get_pinned_facts(20)
+    texts = [f["fact"] for f in pinned]
+    assert texts == ["pin me"]
+
+
+def test_search_memory_excludes_pending_facts(tmp_path):
+    import sqlite3
+    from mcp_chatbot.memory.store import EpisodicStore
+    store = EpisodicStore(tmp_path / "memory.db")
+    store.remember_fact("zebra approved")  # approved, should be found
+    with sqlite3.connect(store._path) as conn:
+        conn.execute(
+            "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) "
+            "VALUES ('zebra pending', 0, 0, 'agent', 'pending')"
+        )
+    results = store.search_memory("zebra")
+    assert all(r["text"] != "zebra pending" for r in results)
+    assert any(r["text"] == "zebra approved" for r in results)

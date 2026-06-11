@@ -179,9 +179,25 @@ class FileManager:
                 matched = stripped
                 count = 1
         if count == 0:
+            # Defensive: model often pads blank/continuation lines with trailing
+            # whitespace it invented. Retry on a per-line rstrip'd comparison and,
+            # if a single line-aligned window matches, splice the original span.
+            c_lines = content_n.split("\n")
+            f_lines = [ln.rstrip() for ln in find_n.split("\n")]
+            n = len(f_lines)
+            if n:
+                hits = [
+                    i
+                    for i in range(len(c_lines) - n + 1)
+                    if [ln.rstrip() for ln in c_lines[i : i + n]] == f_lines
+                ]
+                if len(hits) == 1:
+                    matched = "\n".join(c_lines[hits[0] : hits[0] + n])
+                    count = 1
+        if count == 0:
             return (
                 f"Error: find text not found in '{path}'. "
-                "Re-read the file and copy the exact text (no line numbers)."
+                "Re-read the file and copy the exact text (same blank spaces, no line numbers)."
             )
         if count > 1:
             return (

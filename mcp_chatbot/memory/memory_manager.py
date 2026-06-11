@@ -16,7 +16,7 @@ class MemoryManager:
 
     @property
     def safe_tool_names(self) -> set[str]:
-        return {"search_memory"}
+        return {"search_memory", "remember_fact"}
 
     def execute(self, tool_name: str, arguments: dict) -> str:
         try:
@@ -32,8 +32,8 @@ class MemoryManager:
                         f"Call update_fact with fact_id={match['id']} and new_fact='<replacement text>, "
                         f"or forget_fact({match['id']}) if it is no longer relevant."
                     )
-                fact_id = self._store.remember_fact(fact, source=source)
-                return f"Remembered fact #{fact_id}: {fact}"
+                fact_id = self._store.remember_fact(fact, source=source, status="pending")
+                return f"Fact #{fact_id} queued for review: {fact}"
 
             if tool_name == "update_fact":
                 fact_id = arguments.get("fact_id")
@@ -81,9 +81,10 @@ class MemoryManager:
                 "function": {
                     "name": "remember_fact",
                     "description": (
-                        "Store a persistent fact in long-term memory. "
+                        "Queue a persistent fact for the user to review and approve. "
                         "Use for user preferences, project constants, or important knowledge "
-                        "that should survive across sessions."
+                        "that should survive across sessions. The fact is NOT stored live — "
+                        "it waits in a pending queue until the user approves it."
                     ),
                     "parameters": {
                         "type": "object",

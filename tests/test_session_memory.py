@@ -15,7 +15,8 @@ def _msgs(n_turns: int) -> list[dict]:
 def make_session(summary_text="Summary.", mock_store=None):
     store = mock_store if mock_store is not None else MagicMock()
     store.get_recent.return_value = []
-    store.get_key_facts.return_value = []   # ← stub so "no facts → block omitted" tests work
+    store.get_key_facts.return_value = []    # ← stub so legacy tests that check get_key_facts are clean
+    store.get_pinned_facts.return_value = [] # ← stub so "no pinned facts → block omitted" tests work
     with patch("mcp_chatbot.core.session.load_settings", return_value={}), \
          patch("mcp_chatbot.core.session.SkillsManager"), \
          patch("mcp_chatbot.core.session.TaskManager"), \
@@ -85,6 +86,30 @@ def test_build_system_message_injects_memory_block():
     assert "User worked on MCP client with Gradio UI." in system_content
 
 
+def test_build_system_message_resets_history_by_default():
+    s, _ = make_session()
+    s.messages = [{"role": "user", "content": "old system"},
+                  {"role": "user", "content": "U1"},
+                  {"role": "assistant", "content": "A1"}]
+    with patch("mcp_chatbot.core.session.load_settings", return_value={}):
+        asyncio.run(s.build_system_message())
+    # Default contract: history is discarded, only the fresh system prompt remains.
+    assert len(s.messages) == 1
+    assert s.messages[0]["role"] == "user"
+
+
+def test_build_system_message_preserve_history_keeps_tail():
+    s, _ = make_session()
+    s.messages = [{"role": "user", "content": "old system"},
+                  {"role": "user", "content": "U1"},
+                  {"role": "assistant", "content": "A1"}]
+    with patch("mcp_chatbot.core.session.load_settings", return_value={}):
+        asyncio.run(s.build_system_message(preserve_history=True))
+    # System prompt rebuilt in place; conversation tail retained.
+    assert [m["content"] for m in s.messages[1:]] == ["U1", "A1"]
+    assert s.messages[0]["content"] != "old system"  # system prompt was rebuilt
+
+
 def test_build_system_message_no_memory_when_store_none():
     s, _ = make_session()
     s.episodic_store = None
@@ -121,14 +146,14 @@ def test_build_system_message_defaults_to_3_episodes():
 
 def test_build_system_message_injects_key_facts_block():
     s, store = make_session()
-    store.get_key_facts.return_value = [
+    store.get_pinned_facts.return_value = [
         {"id": 3, "fact": "Project uses Python 3.11", "created_at": 1747612800.0, "source": "agent"},
         {"id": 7, "fact": "User prefers no docstrings", "created_at": 1747612801.0, "source": "agent"},
     ]
     with patch("mcp_chatbot.core.session.load_settings", return_value={}):
         asyncio.run(s.build_system_message())
     content = s.messages[0]["content"]
-    assert "[Key Facts]:" in content
+    assert "[Pinned Facts]:" in content
     assert "#3 Project uses Python 3.11" in content
     assert "#7 User prefers no docstrings" in content
 
@@ -151,7 +176,7 @@ def test_build_system_message_no_key_facts_block_when_store_none():
 
 def test_build_system_message_key_facts_show_ids():
     s, store = make_session()
-    store.get_key_facts.return_value = [
+    store.get_pinned_facts.return_value = [
         {"id": 12, "fact": "LM Studio runs on port 1234", "created_at": 1747612800.0, "source": "agent"},
     ]
     with patch("mcp_chatbot.core.session.load_settings", return_value={}):
@@ -161,18 +186,16 @@ def test_build_system_message_key_facts_show_ids():
 
 def test_build_system_message_uses_memory_key_facts_setting():
     s, store = make_session()
-    store.get_key_facts.return_value = []
     with patch("mcp_chatbot.core.session.load_settings", return_value={"memory_key_facts": 5}):
         asyncio.run(s.build_system_message())
-    store.get_key_facts.assert_called_with(5)
+    store.get_pinned_facts.assert_called_with(5)
 
 
 def test_build_system_message_defaults_to_20_key_facts():
     s, store = make_session()
-    store.get_key_facts.return_value = []
     with patch("mcp_chatbot.core.session.load_settings", return_value={}):
         asyncio.run(s.build_system_message())
-    store.get_key_facts.assert_called_with(20)
+    store.get_pinned_facts.assert_called_with(20)
 
 
 # ── _compress_history episode write ───────────────────────────────────────────
@@ -416,11 +439,26 @@ def test_build_system_message_skips_episodes_when_flag_false():
 def test_build_system_message_always_injects_key_facts_when_flag_false():
     """Key facts must still appear when load_episodes=False."""
     s, store = make_session()
-    store.get_key_facts.return_value = [
+    store.get_pinned_facts.return_value = [
         {"id": 1, "fact": "User prefers Python", "created_at": 1747612800.0, "source": "user"},
     ]
     s.load_episodes = False
     with patch("mcp_chatbot.core.session.load_settings", return_value={}):
         asyncio.run(s.build_system_message())
-    assert "[Key Facts]:" in s.messages[0]["content"]
+    assert "[Pinned Facts]:" in s.messages[0]["content"]
     assert "#1 User prefers Python" in s.messages[0]["content"]
+
+
+def test_system_prompt_uses_pinned_facts():
+    """build_system_message injects pinned facts (get_pinned_facts) not unpinned ones (get_key_facts)."""
+    s, store = make_session()
+    store.get_pinned_facts.return_value = [
+        {"id": 1, "fact": "pinned alpha", "created_at": 0, "source": "user"}
+    ]
+    store.get_key_facts.return_value = [
+        {"id": 2, "fact": "unpinned beta", "created_at": 0, "source": "agent"}
+    ]
+    with patch("mcp_chatbot.core.session.load_settings", return_value={}):
+        asyncio.run(s.build_system_message())
+    assert "pinned alpha" in s.messages[0]["content"]
+    assert "unpinned beta" not in s.messages[0]["content"]

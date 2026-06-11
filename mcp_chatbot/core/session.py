@@ -13,6 +13,7 @@ import datetime
 
 from mcp_chatbot.core.server import Server
 from mcp_chatbot.core.llm_client import LLMClient
+from mcp_chatbot.core.schemas import EpisodeResult
 from mcp_chatbot.tools.skills_manager import SkillsManager
 from mcp_chatbot.tools.file_manager import FileManager
 from mcp_chatbot.settings import load_settings
@@ -40,6 +41,15 @@ COMPRESSION_KEEP_TURNS = 4
 # interrupts a turn via the stop button. Kept as one constant so the yielded
 # display string and the persisted history marker can never drift apart.
 STOPPED_MARKER = "_[Stopped by user]_"
+# Appended to the assistant bubble when the backend stops generation because the
+# completion hit max_output_tokens (finish_reason == "length"). The answer is
+# truncated mid-output; this tells the user (and persists to history) rather than
+# leaving a silently cut-off message.
+TRUNCATED_MARKER = "_[Output truncated — hit max_output_tokens cap]_"
+# Yielded after a tool call is approved, before the (possibly slow) execution,
+# so the frontend can retract the approval gate immediately instead of leaving
+# it spinning until the result arrives. Consumed in handle_chat — never shown.
+GATE_CLOSE_MARKER = "\x00gate_close\x00"
 
 
 class ChatSession:
@@ -136,6 +146,20 @@ class ChatSession:
         # procedures feed the same reinforce/penalize loop the planner-injected
         # ones do. Reset each turn.
         self._retrieved_procedures: list[dict] = []
+        # On-demand fact retrieval: sliding window of recently-retrieved facts.
+        # Each entry {"id": int, "fact": str, "ttl": int}; ttl decremented each
+        # user turn, dropped at 0. Ephemeral — never written to history.
+        self._fact_window: list[dict] = []
+        self._retrieval_k: int = settings.get("memory_retrieval_k", 5)
+        self._retrieval_ttl: int = settings.get("memory_retrieval_ttl", 3)
+        self._memory_block: str = ""  # rendered [Relevant Facts] block for current turn
+        # Loop-end nudge to capture durable facts. Counts user turns; persisted
+        # to settings.json so short sessions still eventually trigger it.
+        self._facts_nudge_counter: int = settings.get("facts_nudge_progress", 0)
+        self._facts_nudge_threshold: int = settings.get("facts_nudge_turns", 8)
+        self._pending_facts_nudge: bool = False
+        self._playbook_fired_this_turn: bool = False
+        self._consumed_nudge: str = ""
 
     def reinitialize_root(self, root: Path) -> None:
         """Reinitialize all file-root-dependent components when the root changes."""
@@ -192,12 +216,19 @@ class ChatSession:
             self._is_initialized = False
             return False
 
-    async def build_system_message(self) -> None:
+    async def build_system_message(self, preserve_history: bool = False) -> None:
         """
         Collect all tool schemas from active servers and build the initial
         messages list.  Tool descriptions are no longer injected as plain
         text — they are registered as proper OpenAI-style function schemas
         and passed to the API on every request.
+
+        By default this resets `self.messages` to just the system prompt
+        (startup / settings-change / memory-reset contract). Pass
+        `preserve_history=True` to rebuild the system prompt in place while
+        keeping the existing conversation tail — used when a mid-session action
+        (e.g. approving/pinning a fact) must refresh the prompt without
+        wiping the live chat.
         """
         try:
             self._tool_schemas = []
@@ -206,6 +237,10 @@ class ChatSession:
             self._active_skill = None
             self._injected_skill_schemas = []
             settings = load_settings()
+
+            blacklist = settings.get("tool_blacklist") or {}
+            blacklisted_tools = set(blacklist.get("tools") or [])
+            blacklisted_skills = set(blacklist.get("skills") or [])
 
             for server in self.servers:
                 if self.active_servers[server.name]:
@@ -225,6 +260,8 @@ class ChatSession:
             identity = "You are a helpful assistant. "
 
             skill_index = self._skills_manager.get_index()
+            if blacklisted_skills:
+                skill_index = [s for s in skill_index if s["name"] not in blacklisted_skills]
             if skill_index:
                 skills_lines = "\n".join(
                     f"- {s['name']}: {s['description']}" for s in skill_index
@@ -290,9 +327,10 @@ class ChatSession:
                 )
                 memory_tool_context = (
                     "\n\n## Memory Tools\n"
-                    "Key facts injected above show IDs — use those IDs directly with update_fact or forget_fact. "
-                    "search_memory runs silently — use it to search episodes and for facts beyond the displayed cap. "
-                    "remember_fact, update_fact, and forget_fact persist across sessions and require user approval."
+                    "Pinned facts injected above show IDs — use those IDs directly with update_fact or forget_fact. "
+                    "search_memory runs silently — use it to search episodes and for facts beyond the pinned set. "
+                    "remember_fact queues a fact for the user to review later (no inline prompt) — call it freely for durable facts. "
+                    "update_fact and forget_fact persist across sessions and require user approval."
                     + search_note
                 )
 
@@ -310,10 +348,10 @@ class ChatSession:
             key_facts_context = ""
             if self.episodic_store:
                 n_facts = settings.get("memory_key_facts", 20)
-                facts = await asyncio.to_thread(self.episodic_store.get_key_facts, n_facts)
+                facts = await asyncio.to_thread(self.episodic_store.get_pinned_facts, n_facts)
                 if facts:
                     fact_lines = [f"#{f['id']} {f['fact']}" for f in facts]
-                    key_facts_context = "\n\n[Key Facts]:\n" + "\n".join(fact_lines)
+                    key_facts_context = "\n\n[Pinned Facts]:\n" + "\n".join(fact_lines)
 
             playbook_hint = ""
             if self.playbook_manager:
@@ -344,7 +382,12 @@ class ChatSession:
             with open("system_prompt_log.md", "w", encoding="utf-8") as f:
                 f.write(system_content)
 
-            self.messages = [{"role": "user", "content": system_content}]
+            if preserve_history and len(self.messages) > 1:
+                # Refresh the system prompt in place (e.g. after approving/pinning
+                # a fact mid-session) without discarding the live conversation.
+                self.messages = [{"role": "user", "content": system_content}] + self.messages[1:]
+            else:
+                self.messages = [{"role": "user", "content": system_content}]
 
             if skill_index:
                 self._tool_schemas.append(self._skills_manager.tool_schema)
@@ -371,17 +414,25 @@ class ChatSession:
                 for schema in self.playbook_manager.tool_schemas:
                     self._tool_schemas.append(schema)
 
+            if blacklisted_tools:
+                self._tool_schemas = [
+                    s for s in self._tool_schemas
+                    if s.get("function", {}).get("name") not in blacklisted_tools
+                ]
+
             logging.info("Registered %d tool(s) and %d skill(s).", len(self._tool_schemas), len(skill_index))
         except Exception as e:
             error_msg = f"Error building system messages: {str(e)}"
             logging.error(error_msg)
             raise Exception(error_msg)
 
-    def _inject_task_block(self, messages: list[dict], hint: str = "") -> list[dict]:
-        if self.task_manager is None and not hint:
+    def _inject_task_block(self, messages: list[dict], hint: str = "", extra: str = "") -> list[dict]:
+        if self.task_manager is None and not hint and not extra:
             return messages
         block = self.task_manager.render_block() if self.task_manager else ""
         prefix_parts = []
+        if extra:
+            prefix_parts.append(extra)
         if hint:
             prefix_parts.append(hint)
         if block:
@@ -391,6 +442,8 @@ class ChatSession:
         if not prefix_parts:
             return messages
         prefix = "\n\n".join(prefix_parts)
+        with open("prefix_log.md", "w", encoding="utf-8") as f:
+            f.write(prefix)
         last = messages[-1]
         content = last["content"]
         if isinstance(content, str):
@@ -398,6 +451,36 @@ class ChatSession:
         else:
             new_content = [{"type": "text", "text": prefix}] + list(content)
         return messages[:-1] + [{**last, "content": new_content}]
+
+    def _update_fact_window(self, user_text: str) -> None:
+        """Decay the existing window one step, then merge in fresh approved-fact
+        hits for this turn's user input (TTL reset on hit). Episodes excluded."""
+        for entry in self._fact_window:
+            entry["ttl"] -= 1
+        self._fact_window = [e for e in self._fact_window if e["ttl"] > 0]
+        if not (self.episodic_store and user_text.strip()):
+            return
+        try:
+            results = self.episodic_store.search_facts(user_text, limit=self._retrieval_k)
+        except Exception as e:
+            logging.warning("Fact retrieval failed: %s", e)
+            return
+        by_id = {e["id"]: e for e in self._fact_window}
+        for r in results:
+            if r.get("type") != "fact":
+                continue
+            if r["id"] in by_id:
+                by_id[r["id"]]["ttl"] = self._retrieval_ttl
+            else:
+                entry = {"id": r["id"], "fact": r["text"], "ttl": self._retrieval_ttl}
+                self._fact_window.append(entry)
+                by_id[r["id"]] = entry
+
+    def _render_fact_window(self) -> str:
+        if not self._fact_window:
+            return ""
+        lines = [f"#{e['id']} {e['fact']}" for e in self._fact_window]
+        return "(System info - [Relevant Facts] retrieved from memory:\n" + "\n".join(lines) + ")"
 
     def _should_suggest_plan(self, user_input: str | list) -> bool:
         if isinstance(user_input, str):
@@ -554,6 +637,39 @@ class ChatSession:
                 args = {}
             result_text = self.playbook_manager.execute("record_procedure", args)
             yield f"record_procedureo|o{tool_arg}o|o{result_text}o|oFalse"
+
+    def _maybe_arm_facts_nudge(self) -> None:
+        """At a completed turn: arm the nudge if enough user turns have passed and
+        the playbook prompt did not already fire this turn. Counter is NOT reset
+        here — it resets only when the nudge is consumed, so a session that ends
+        right after arming re-arms next session instead of losing the count."""
+        if (
+            self._facts_nudge_counter >= self._facts_nudge_threshold
+            and not self._playbook_fired_this_turn
+        ):
+            self._pending_facts_nudge = True
+
+    def _consume_facts_nudge(self) -> str:
+        """Return the nudge text if armed (and reset), else empty string."""
+        if not self._pending_facts_nudge:
+            return ""
+        self._pending_facts_nudge = False
+        self._facts_nudge_counter = 0
+        return (
+            "[Memory] Several turns have passed. If this conversation surfaced durable "
+            "facts worth keeping (user preferences, project constants, decisions), call "
+            "remember_fact for each now. Skip if nothing is worth persisting."
+        )
+
+    def persist_nudge_state(self) -> None:
+        """Persist the user-turn counter across sessions (short-session fix)."""
+        try:
+            from mcp_chatbot.settings import load_settings, save_settings
+            s = load_settings()
+            s["facts_nudge_progress"] = self._facts_nudge_counter
+            save_settings(s)
+        except Exception as e:
+            logging.warning("Could not persist nudge state: %s", e)
 
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
@@ -753,6 +869,17 @@ class ChatSession:
 
         self.messages.append({"role": "user", "content": user_input})
 
+        _user_text = user_input if isinstance(user_input, str) else " ".join(
+            p.get("text", "") for p in user_input
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+        self._update_fact_window(_user_text)
+        self._memory_block = self._render_fact_window()
+
+        self._facts_nudge_counter += 1
+        self._playbook_fired_this_turn = False
+        self._consumed_nudge = self._consume_facts_nudge()
+
         self.interrupt_requested = False
         if self.allow_tool_action == "interrupt":
             self.allow_tool_action = None
@@ -827,7 +954,10 @@ class ChatSession:
             tool_calls = None
             tool_names = {}
             tool_args = {}
-            call_messages = self._inject_task_block(self.messages, hint=_hint)
+            if self._consumed_nudge:
+                _hint = (_hint + "\n\n" + self._consumed_nudge).strip() if _hint else self._consumed_nudge
+                self._consumed_nudge = ""  # merge once; don't re-inject on loop iterations
+            call_messages = self._inject_task_block(self.messages, hint=_hint, extra=self._memory_block)
             _hint = ""  # consume — subsequent iterations don't repeat hint
 
             if self.task_manager:
@@ -862,9 +992,10 @@ class ChatSession:
                 self.agent_loop["state"] = "compressing"
                 await self._compress_history()
                 self.agent_loop["state"] = ""
-                call_messages = self._inject_task_block(self.messages, hint="")
+                call_messages = self._inject_task_block(self.messages, hint="", extra=self._memory_block)
                 _compressed_this_turn = True
             self.agent_loop["state"] = "streaming"
+            truncated = False
             for event in self.llm_client.stream_response(call_messages, tools=tools):
                 if event["type"] == "content":
                     if self.interrupt_requested:
@@ -879,8 +1010,20 @@ class ChatSession:
                     tool_calls = event["data"]
                 elif event["type"] == "usage":
                     self.token_usage["usage"] = event["data"]
+                elif event["type"] == "truncated":
+                    truncated = True
                 elif event["type"] == "error":
                     assistant_msg += event["data"]
+            if truncated:
+                logging.warning(
+                    "LLM completion hit max_output_tokens (finish_reason=length); "
+                    "output truncated%s.", " mid tool-call" if tool_calls else ""
+                )
+                # Only surface to the user on a text answer; a truncated tool-call
+                # falls through to the parse-retry guard, which handles the bad JSON.
+                if not tool_calls:
+                    assistant_msg += f"\n\n{TRUNCATED_MARKER}"
+                    yield f"\n\n{TRUNCATED_MARKER}"
             logging.debug("tool_names: %s", tool_names)
             logging.debug("tool_args: %s", tool_args)
             self.agent_loop["state"] = ""
@@ -956,6 +1099,7 @@ class ChatSession:
                     self._injected_skill_schemas = []
                     self._active_skill = None
                 self.agent_loop = {"active": False, "state": ""}
+                self._maybe_arm_facts_nudge()
                 with open("mcp_chatbot/log.json", "w") as f:
                     json.dump(self.messages, f, indent=2)
                 break
@@ -1059,6 +1203,10 @@ class ChatSession:
 
                     self.tool_call_detected = False
 
+                    # Gate was shown for this non-safe call; retract it now,
+                    # before the slow execution, so it doesn't spin/linger.
+                    yield GATE_CLOSE_MARKER
+
                 result_text = await self._execute_tool_call(tool_call)
 
                 # A fresh plan supersedes any prior attribution tracking: the
@@ -1123,6 +1271,7 @@ class ChatSession:
                     and self.task_manager is not None
                     and self.task_manager._last_all_done
                 ):
+                    self._playbook_fired_this_turn = True
                     self._reinforce_injected_procedures()
                     self.task_manager._last_all_done = False
                     async for event in self._run_playbook_prompt():
@@ -1184,11 +1333,17 @@ class ChatSession:
             logging.info("Short session - Session episode not saved.")
             return
         def _summarize_and_save() -> bool:
-            summary = self._summarize(history)
-            if summary:
-                self.episodic_store.add_episode(self._session_id, summary, "agent")
-                return True
-            return False
+            summary, facts = self._summarize_with_facts(history)
+            if not summary:
+                return False
+            self.episodic_store.add_episode(self._session_id, summary, "agent")
+            for fact in facts:
+                try:
+                    if self.episodic_store.find_similar_fact(fact) is None:
+                        self.episodic_store.remember_fact(fact, source="agent", status="pending")
+                except Exception as e:
+                    logging.warning("Co-extraction fact write failed: %s", e)
+            return True
 
         logging.info("Saving session episode — summarizing history...")
         try:
@@ -1227,6 +1382,57 @@ class ChatSession:
         except Exception as e:
             logging.warning("Summarization failed: %s", e)
             return None
+
+    def _summarize_with_facts(self, messages: list[dict]) -> tuple[str | None, list[str]]:
+        """Structured shutdown summary: one call yields both the episode summary
+        and candidate durable facts. Uses response_format on the local path; on
+        any parse failure (e.g. a remote backend that ignores response_format)
+        falls back to treating the whole response as the summary with no facts.
+
+        Separate from _summarize because _summarize is shared with
+        _compress_history and must keep returning a plain string."""
+        def _format_message(message):
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return f"{message['role'].upper()}: {content}"
+            elif isinstance(content, list) and content:
+                text = content[0].get("text", "")
+                return f"{message['role'].upper()}: {text} (user submitted an image)"
+            return None
+
+        text = "\n".join(m for m in (_format_message(x) for x in messages if x.get("content")) if m)
+        if not text:
+            return None, []
+        prompt = [{"role": "user", "content": (
+            "Summarize the following conversation concisely, preserving key decisions, "
+            "facts, tool results, and context needed to continue. Then extract any "
+            "durable facts worth remembering long-term (user preferences, project "
+            "preferences, info about user) as short self-contained statements; use an empty "
+            "list if there are none.\n\n"
+            f"<conversation>\n{text}\n</conversation>"
+        )}]
+        fmt = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "episode_result",
+                "strict": True,
+                "schema": EpisodeResult.model_json_schema(),
+            },
+        }
+        try:
+            response = self.llm_client.get_response(prompt, response_format=fmt)
+            content = (response.get("content") or "").strip()
+        except Exception as e:
+            logging.warning("Co-extraction call failed: %s", e)
+            return None, []
+        if not content:
+            return None, []
+        try:
+            data = EpisodeResult.model_validate_json(content)
+            return (data.summary.strip() or None), [f.strip() for f in data.facts if f.strip()]
+        except Exception:
+            # Backend ignored response_format or returned prose — keep the summary.
+            return content, []
 
     async def _compress_history(self) -> None:
         """Compress old conversation by summarizing and keeping only recent turns."""

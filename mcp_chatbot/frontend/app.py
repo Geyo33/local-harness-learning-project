@@ -1,6 +1,6 @@
 import asyncio
 import gradio as gr
-from mcp_chatbot.core.session import ChatSession
+from mcp_chatbot.core.session import ChatSession, GATE_CLOSE_MARKER
 from mcp_chatbot.core.server import Server
 from mcp_chatbot.core.llm_client import LLMClient
 from mcp_chatbot.core.config import Configuration
@@ -70,7 +70,9 @@ async def update_servers(selected_servers: list):
         await chat_session.session.cleanup_servers()
         await chat_session.session.list_servers()
         await chat_session.session.initialize_servers()
-        await chat_session.session.build_system_message()
+        # Refresh tool schemas for the new server set while keeping the live
+        # conversation (build_system_message resets history by default).
+        await chat_session.session.build_system_message(preserve_history=True)
         return
 
     await chat_session.session.cleanup_servers()
@@ -80,7 +82,7 @@ async def update_servers(selected_servers: list):
     logging.info(f"Updating with: {selected_servers}")
 
     await chat_session.session.initialize_servers()
-    await chat_session.session.build_system_message()
+    await chat_session.session.build_system_message(preserve_history=True)
     logging.info("\n--- Servers updated ---")
 
 
@@ -88,6 +90,7 @@ async def _cleanup_session():
     """Tear down servers and drop the session (no episode save)."""
     if chat_session.session:
         logging.info("\n--- Initiating Graceful Shutdown ---")
+        chat_session.session.persist_nudge_state()
         await chat_session.session.cleanup_servers()
         chat_session.session = None
 
@@ -174,8 +177,67 @@ async def clear_memory() -> tuple[str, str]:
     if not chat_session.session or not chat_session.session.episodic_store:
         return "Memory not available.", "Memory not available."
     chat_session.session.episodic_store.clear_all()
-    await chat_session.session.build_system_message()
+    # Rebuild the system prompt without the now-empty memory blocks while keeping
+    # the live conversation (build_system_message resets history by default).
+    await chat_session.session.build_system_message(preserve_history=True)
     return render_episodes([]), render_key_facts([])
+
+
+def _pending_facts() -> list[dict]:
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return []
+    return chat_session.session.episodic_store.get_pending_facts()
+
+
+def pending_header() -> str:
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return "### Memory not available."
+    return f"### Pending review: {chat_session.session.episodic_store.count_pending()}"
+
+
+async def approve_pending_fact(fact_id, edited_text, pin):
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return
+    store = chat_session.session.episodic_store
+    store.approve_fact(int(fact_id), new_fact=(edited_text or None), pinned=bool(pin))
+    # Refresh the system prompt so a newly-pinned fact takes effect immediately,
+    # preserving the live conversation (build_system_message resets history by default).
+    await chat_session.session.build_system_message(preserve_history=True)
+
+
+def reject_pending_fact(fact_id):
+    if not chat_session.session or not chat_session.session.episodic_store:
+        return
+    chat_session.session.episodic_store.forget_fact(int(fact_id))
+
+
+# Pending Facts tab uses a fixed pool of pre-built row groups (static component
+# graph — no @gr.render). refresh_pending_rows() shows/fills the first N groups
+# from the pending list and hides the rest. Output order per row must match the
+# component build order below: [group, label, id_state, edit, pin].
+MAX_PENDING_ROWS = 30
+
+
+def refresh_pending_rows() -> list:
+    import datetime
+    facts = _pending_facts()
+    out = [gr.update(value=pending_header()), gr.update(visible=not facts)]
+    for i in range(MAX_PENDING_ROWS):
+        if i < len(facts):
+            f = facts[i]
+            date_str = datetime.datetime.fromtimestamp(
+                f["created_at"]
+            ).strftime("%Y-%m-%d")
+            out += [
+                gr.update(visible=True),
+                gr.update(value=f"**#{f['id']}**  _{f['source']}, {date_str}_"),
+                f["id"],
+                gr.update(value=f["fact"]),
+                gr.update(value=False),
+            ]
+        else:
+            out += [gr.update(visible=False), gr.update(), None, gr.update(), gr.update()]
+    return out
 
 
 def render_playbook(entries: list[dict]) -> str:
@@ -392,6 +454,13 @@ async def handle_chat(input: dict[str, str | list], history: list, tool_validati
                 yield gr.update(interactive=True), new_history, gr.update(visible=True), gr.update(visible=True), gr.update(visible=True), gr.skip(), gr.skip()
                 continue
 
+            # ── Gate-close signal ──────────────────────────────────────────────
+            # Backend approved the call and is about to execute it; retract the
+            # approval gate now so it doesn't spin/linger during a slow tool run.
+            if chunk == GATE_CLOSE_MARKER:
+                yield gr.update(interactive=False), new_history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.skip(), gr.skip()
+                continue
+
             # ── Structured event chunk (tool result or denial) ─────────────────
             if "o|o" in chunk:
                 parts = chunk.split("o|o", 3)
@@ -435,7 +504,12 @@ async def handle_chat(input: dict[str, str | list], history: list, tool_validati
         new_history = history + [{"role": "assistant", "content": error_msg}]
         yield "", new_history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.skip(), gr.skip()
     finally:
-        yield gr.update(interactive=True), new_history, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        # Always retract the approval gate when the generator ends. Loop-safety
+        # aborts (fingerprint, iteration cap, wall-clock, parse-retry) yield a
+        # plain string rather than a non-safe o|o chunk, so the buttons shown at
+        # the approval request are never hidden by the o|o branch — clear them
+        # here so they can't linger after the loop stops.
+        yield gr.update(interactive=True), new_history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.skip(), gr.skip()
 
 css = """
 
@@ -567,7 +641,34 @@ def build_app():
                     playbook_refresh_btn = gr.Button("Refresh", variant="secondary", size="sm")
                     playbook_clear_btn = gr.Button("Clear Playbook", variant="stop", size="sm")
 
-        demo.load(setup_and_initialize).success(servers_state, outputs=mcp_list).success(update_usage, outputs=usage_bar).success(update_task_panel, outputs=task_list_display).success(load_memory_tab, outputs=[memory_list, facts_list]).success(load_playbook_tab, outputs=playbook_list).success(show_memory_choice, outputs=[memory_choice_md, memory_choice_row, msg_input])
+            with gr.Tab("Pending Facts"):
+                pending_count_md = gr.Markdown("### Pending review: 0")
+                pending_empty_md = gr.Markdown("*No facts awaiting review.*")
+
+                # Pre-built pool of row groups. Hidden by default; refresh shows and
+                # fills the first N. Each row keeps its fact id in a hidden State so
+                # Approve/Reject act on the right fact without manual id entry.
+                pending_rows = []  # (id_state, edit, pin)
+                pending_outputs = [pending_count_md, pending_empty_md]
+                for _ in range(MAX_PENDING_ROWS):
+                    with gr.Group(visible=False) as row_group:
+                        row_label = gr.Markdown()
+                        row_id = gr.State(None)
+                        row_edit = gr.Textbox(
+                            show_label=False, lines=2, container=False
+                        )
+                        row_pin = gr.Checkbox(
+                            label="Pin (inject into system prompt)", value=False
+                        )
+                        with gr.Row():
+                            row_approve = gr.Button("Approve", variant="primary", size="sm")
+                            row_reject = gr.Button("Reject", variant="stop", size="sm")
+                    pending_rows.append((row_id, row_edit, row_pin, row_approve, row_reject))
+                    pending_outputs += [row_group, row_label, row_id, row_edit, row_pin]
+
+                pending_refresh_btn = gr.Button("Refresh", variant="secondary", size="sm")
+
+        demo.load(setup_and_initialize).success(servers_state, outputs=mcp_list).success(update_usage, outputs=usage_bar).success(update_task_panel, outputs=task_list_display).success(load_memory_tab, outputs=[memory_list, facts_list]).success(load_playbook_tab, outputs=playbook_list).success(refresh_pending_rows, outputs=pending_outputs).success(show_memory_choice, outputs=[memory_choice_md, memory_choice_row, msg_input])
 
         demo.unload(shutdown_client)
 
@@ -585,10 +686,14 @@ def build_app():
         async def allow_tool():
             await chat_session.session.set_allow_tool_action("allow")
         tool_allow_btn.click(allow_tool)
+        # Deny ends the call immediately, so hiding the gate straight from the
+        # click handler works (this is the path that worked in testing). Allow,
+        # by contrast, kicks off a slow execution, so it retracts the gate from
+        # inside handle_chat via GATE_CLOSE_MARKER instead.
         async def deny_tool(msg_input: gr.MultimodalTextbox):
             await chat_session.session.set_allow_tool_action("deny", msg_input.value["text"])
-            return gr.update(value="")
-        tool_deny_btn.click(deny_tool, msg_input, msg_input)
+            return gr.update(value=""), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        tool_deny_btn.click(deny_tool, msg_input, [msg_input, tool_validation_box, tool_allow_btn, tool_deny_btn])
 
         def autotool(value):
             if value:
@@ -637,6 +742,26 @@ def build_app():
 
         playbook_refresh_btn.click(load_playbook_tab, outputs=playbook_list)
         playbook_clear_btn.click(clear_playbook, outputs=playbook_list)
+
+        # Pending Facts tab: refresh + per-row Approve/Reject all redraw the row
+        # pool via refresh_pending_rows (outputs match pending_outputs order).
+        pending_refresh_btn.click(refresh_pending_rows, outputs=pending_outputs)
+
+        async def _approve_row(fid, edited, pinned):
+            if fid is not None:
+                await approve_pending_fact(fid, edited, pinned)
+
+        def _reject_row(fid):
+            if fid is not None:
+                reject_pending_fact(fid)
+
+        for _row_id, _row_edit, _row_pin, _row_approve, _row_reject in pending_rows:
+            _row_approve.click(
+                _approve_row, inputs=[_row_id, _row_edit, _row_pin]
+            ).then(refresh_pending_rows, outputs=pending_outputs)
+            _row_reject.click(
+                _reject_row, inputs=[_row_id]
+            ).then(refresh_pending_rows, outputs=pending_outputs)
 
     return demo
     

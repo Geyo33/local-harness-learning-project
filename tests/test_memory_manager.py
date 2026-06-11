@@ -9,9 +9,28 @@ def _manager():
 
 # ── metadata ──────────────────────────────────────────────────────────────────
 
-def test_safe_tool_names_contains_only_search_memory():
+def test_safe_tool_names_contains_search_and_remember():
     mgr, _ = _manager()
-    assert mgr.safe_tool_names == {"search_memory"}
+    assert mgr.safe_tool_names == {"search_memory", "remember_fact"}
+
+
+def test_remember_fact_in_safe_tools():
+    from mcp_chatbot.memory.memory_manager import MemoryManager
+    from unittest.mock import MagicMock
+    mgr = MemoryManager(MagicMock())
+    assert "remember_fact" in mgr.safe_tool_names
+
+
+def test_remember_fact_writes_pending():
+    from mcp_chatbot.memory.memory_manager import MemoryManager
+    from unittest.mock import MagicMock
+    store = MagicMock()
+    store.find_similar_fact.return_value = None
+    store.remember_fact.return_value = 7
+    mgr = MemoryManager(store)
+    out = mgr.execute("remember_fact", {"fact": "user prefers tabs", "source": "user"})
+    store.remember_fact.assert_called_once_with("user prefers tabs", source="user", status="pending")
+    assert "review" in out.lower()
 
 
 def test_tool_names_contains_all_four():
@@ -37,9 +56,9 @@ def test_remember_fact_calls_store_with_agent_source():
     store.find_similar_fact.return_value = None
     store.remember_fact.return_value = 7
     result = mgr.execute("remember_fact", {"fact": "User prefers dark mode."})
-    store.remember_fact.assert_called_once_with("User prefers dark mode.", source="agent")
-    assert "Remembered fact #7" in result
-    assert "User prefers dark mode." in result
+    store.remember_fact.assert_called_once_with("User prefers dark mode.", source="agent", status="pending")
+    assert "#7" in result
+    assert "review" in result.lower()
 
 
 def test_remember_fact_empty_returns_error():
@@ -151,8 +170,9 @@ def test_remember_fact_inserts_when_no_duplicate():
     store.find_similar_fact.return_value = None
     store.remember_fact.return_value = 5
     result = mgr.execute("remember_fact", {"fact": "Project uses uv for packaging."})
-    store.remember_fact.assert_called_once_with("Project uses uv for packaging.", source="agent")
-    assert "Remembered fact #5" in result
+    store.remember_fact.assert_called_once_with("Project uses uv for packaging.", source="agent", status="pending")
+    assert "#5" in result
+    assert "review" in result.lower()
 
 
 def test_remember_fact_duplicate_check_uses_stripped_fact():

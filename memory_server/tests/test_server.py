@@ -34,7 +34,10 @@ def _make_db() -> tuple[sqlite3.Connection, str]:
             fact TEXT NOT NULL,
             created_at REAL NOT NULL,
             last_accessed REAL NOT NULL,
-            source TEXT NOT NULL
+            source TEXT NOT NULL,
+            pinned INTEGER DEFAULT 0,
+            tags TEXT,
+            status TEXT DEFAULT 'approved'
         )
     """)
     conn.execute("""
@@ -45,6 +48,16 @@ def _make_db() -> tuple[sqlite3.Connection, str]:
     conn.execute("""
         CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
             INSERT INTO episodes_fts(rowid, summary) VALUES (new.id, new.summary);
+        END
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS key_facts_fts USING fts5(
+            fact, content='key_facts', content_rowid='id'
+        )
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS key_facts_ai AFTER INSERT ON key_facts BEGIN
+            INSERT INTO key_facts_fts(rowid, fact) VALUES (new.id, new.fact);
         END
     """)
     conn.commit()
@@ -200,6 +213,45 @@ def test_keyword_search_finds_key_fact_via_like():
     fact_results = [r for r in results if r["type"] == "fact"]
     assert len(fact_results) == 1
     assert "dark mode" in fact_results[0]["text"]
+
+
+def test_keyword_search_matches_conversational_query():
+    # Tokens are OR-joined: a full natural-language question matches rows sharing
+    # only some keywords. Raw FTS5 implicit-AND would require every filler word
+    # ("what", "about", "being") present and match nothing.
+    conn, _ = _make_db()
+    server.init_db(conn)
+    conn.execute(
+        "INSERT INTO key_facts (fact, created_at, last_accessed, source) VALUES (?, ?, ?, ?)",
+        ("entities init with None tilemap; BaseScene must assign one", 1000.0, 1000.0, "agent"),
+    )
+    conn.commit()
+
+    results = server.keyword_search(
+        conn, "And what about tilemap being None base scene and entities ?", limit=10
+    )
+    assert any(r["type"] == "fact" for r in results)
+
+
+def test_keyword_search_excludes_pending_facts():
+    """Pending (unreviewed) facts must never surface in retrieval — they are
+    invisible to the model until a human approves them."""
+    conn, _ = _make_db()
+    server.init_db(conn)
+    conn.execute(
+        "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) VALUES (?, ?, ?, ?, ?)",
+        ("user prefers dark mode", 1000.0, 1000.0, "agent", "approved"),
+    )
+    conn.execute(
+        "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) VALUES (?, ?, ?, ?, ?)",
+        ("user secretly prefers light mode", 1000.0, 1000.0, "agent", "pending"),
+    )
+    conn.commit()
+
+    results = server.keyword_search(conn, "mode", limit=10)
+    fact_texts = [r["text"] for r in results if r["type"] == "fact"]
+    assert "user prefers dark mode" in fact_texts
+    assert "user secretly prefers light mode" not in fact_texts
 
 
 def test_keyword_search_normalizes_scores():

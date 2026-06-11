@@ -27,7 +27,10 @@ def _init_db(conn: sqlite3.Connection) -> None:
                 fact TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 last_accessed REAL NOT NULL,
-                source TEXT NOT NULL
+                source TEXT NOT NULL,
+                pinned INTEGER DEFAULT 0,
+                tags TEXT,
+                status TEXT DEFAULT 'approved'
             )
         """)
         conn.execute("""
@@ -84,12 +87,18 @@ def _init_db(conn: sqlite3.Connection) -> None:
         """)
 
 
-def _insert_fact(conn: sqlite3.Connection, fact: str, source: str = "agent", days_ago: float = 10.0) -> int:
+def _insert_fact(
+    conn: sqlite3.Connection,
+    fact: str,
+    source: str = "agent",
+    days_ago: float = 10.0,
+    status: str = "approved",
+) -> int:
     ts = time.time() - days_ago * 86400
     with conn:
         cursor = conn.execute(
-            "INSERT INTO key_facts (fact, created_at, last_accessed, source) VALUES (?, ?, ?, ?)",
-            (fact, ts, ts, source),
+            "INSERT INTO key_facts (fact, created_at, last_accessed, source, status) VALUES (?, ?, ?, ?, ?)",
+            (fact, ts, ts, source, status),
         )
     return cursor.lastrowid
 
@@ -122,18 +131,35 @@ def test_keyword_search_fts5_score_normalized(tmp_path):
     assert scores[0] != scores[1]  # not flat 1.0
 
 
-def test_keyword_search_fts5_fallback_on_syntax_error(tmp_path):
+def test_keyword_search_fts5_excludes_pending_facts(tmp_path):
+    """On the FTS5 path, pending (unreviewed) facts must never surface — they
+    stay invisible to the model until a human approves them."""
+    db = tmp_path / "memory.db"
+    with closing(sqlite3.connect(db)) as conn:
+        _init_db(conn)
+        _insert_fact(conn, "python is approved", "agent", status="approved")
+        _insert_fact(conn, "python is pending", "agent", status="pending")
+    with closing(sqlite3.connect(db)) as conn:
+        results = server.keyword_search(conn, "python", 10)
+    fact_texts = [r["text"] for r in results if r["type"] == "fact"]
+    assert "python is approved" in fact_texts
+    assert "python is pending" not in fact_texts
+
+
+def test_keyword_search_sanitizes_fts5_punctuation(tmp_path):
     db = tmp_path / "memory.db"
     with closing(sqlite3.connect(db)) as conn:
         _init_db(conn)
         _insert_fact(conn, "fact with bad( paren", "agent")
     with closing(sqlite3.connect(db)) as conn:
-        # "bad(" triggers FTS5 OperationalError (unmatched paren);
-        # LIKE '%bad(%' is a literal match and still finds the fact
+        # "bad(" would be an FTS5 syntax error (unmatched paren) if passed raw.
+        # Tokens are extracted (\w+) and quoted, so it becomes '"bad"' — a valid
+        # query that matches via FTS (no fallback needed). This is the hardening:
+        # arbitrary punctuation in a user query can no longer break the search.
         results = server.keyword_search(conn, "bad(", 10)
     facts = [r for r in results if r["type"] == "fact"]
     assert len(facts) == 1
-    assert facts[0]["score"] == 1.0  # LIKE fallback gives flat score
+    assert facts[0]["text"] == "fact with bad( paren"
 
 
 def test_search_memory_handler_refreshes_last_accessed(tmp_path):

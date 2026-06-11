@@ -56,3 +56,5 @@ mcp_chatbot/log.json
 mcp_chatbot/logs_with_tasks.json
 mcp_chatbot/settings.json
 mcp_chatbot/test.db
+prefix_log.md
+system_prompt_log.md
