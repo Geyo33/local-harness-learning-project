@@ -25,11 +25,12 @@ Built to understand how LLM agent loops, tool orchestration, task planning, cont
 - **Rolling summarization** — compresses old turns into a `[Summary]:` block to keep context within limits
 - **Token usage display** — segmented progress bar in UI showing system / tools / history usage with color thresholds
 - **Episodic memory** — SQLite-backed episode store; last N sessions injected as `[Memory]:` block at startup
-- **Key facts store** — agent-writable persistent facts (`remember_fact`, `update_fact`, `forget_fact`); top-N injected at startup ranked by time-decay score; IDs shown for direct update without search round-trip
+- **Key facts store** — persistent facts on a pinned / approved / pending lifecycle. Only **pinned + approved** facts are injected into the system prompt (`[Pinned Facts]:`); other approved facts surface on demand via an ephemeral per-turn `[Relevant Facts]` retrieval block with a TTL window. `update_fact` / `forget_fact` edit by ID directly
+- **Fact capture & approval** — `remember_fact` runs without an inline gate and queues facts as `pending`; a **Pending Facts** UI tab lists them for review (edit text, pin, approve, or reject). A loop-end nudge reminds the agent to capture durable facts after enough turns (counter persisted across sessions), and on shutdown the episode-summary call co-extracts candidate facts into the same queue via structured `response_format` output
 - **Memory search** — `search_memory` tool: FTS5 BM25 on episodes + key facts, LIKE fallback on syntax error
 - **Semantic memory server** — standalone MCP subproject (`memory_server/`) exposing a `search_memory` tool with three-pass retrieval: cosine similarity on stored embeddings (`BAAI/bge-small-en-v1.5` via LM Studio), FTS5 BM25 keyword search, and spaCy (`en_core_web_sm`) entity/noun-chunk score boost (episodes, key facts, and playbook procedures all indexed); lazy backfill embeds missing episodes on first call; gracefully degrades to keyword-only if embedding endpoint is unreachable, and skips entity boost if spaCy is absent
 - **Playbook / procedural memory** — persistent workflow store in the `procedures` table of `memory.db` (FTS5-indexed); recorded after all tasks complete (`record_procedure`, dedup via SequenceMatcher). On-demand retrieval rather than always-on injection: the planner pass injects the top matches and a safe `search_playbook` tool surfaces them in the main loop. A learning loop decays confidence with disuse, penalizes procedures that precede loop-safety aborts, and reinforces those that precede success
-- **Gradio UI** — browser-based chat with sidebar for server selection, task list, memory, and playbook tabs (optimized for personal use only)
+- **Gradio UI** — browser-based chat with sidebar for server selection, task list, memory, playbook, and pending-facts tabs (optimized for personal use only)
 
 ---
 
@@ -126,6 +127,7 @@ mcp_chatbot/
     config.py          # Configuration
     context_manager.py # ContextManager — token budget tracker + compression trigger
     llm_client.py      # LLMClient (httpx, streaming + non-streaming)
+    schemas.py         # StrictModel base + EpisodeResult (response_format models)
     server.py          # Server, Tool (MCP lifecycle)
     session.py         # ChatSession (agentic loop)
     task_manager.py    # TaskManager (plan/track tasks)
